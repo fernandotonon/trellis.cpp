@@ -348,6 +348,33 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
     }
 
+    if (!cfg.dump_post.empty()) {
+        // Machine-readable raw output for external post-processing pipelines
+        // (mesh cleanup / simplification / UV / baking done by the caller,
+        // e.g. QtMeshEditor): the decoded, hole-filled geometry mesh + the
+        // sparse PBR volume it would be baked from, BEFORE any remesh /
+        // decimation / UV / texture work -- then exit. Binary layout matches
+        // the TRELLIS_DUMP_POST debug env: i32 V,F,Mv,res; f32 verts[V*3];
+        // i32 faces[F*3]; i32 coords[Mv*3]; f32 pbr6[Mv*6] (channels per
+        // voxel: base_color.rgb, metallic, roughness, alpha in [0,1]).
+        FILE* dfp = fopen(cfg.dump_post.c_str(), "wb");
+        if (!dfp) { fprintf(stderr, "cannot write %s\n", cfg.dump_post.c_str()); return 1; }
+        const int dV = mesh.V(), dFc = mesh.F();
+        const int Mv = pbr6.empty() ? 0 : (int)pbr_coords->size(), res = pbr_res;
+        fwrite(&dV,4,1,dfp); fwrite(&dFc,4,1,dfp); fwrite(&Mv,4,1,dfp); fwrite(&res,4,1,dfp);
+        fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp);
+        fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp);
+        if (Mv) {
+            for (auto& c : *pbr_coords) { int xyz[3] = {c[0],c[1],c[2]}; fwrite(xyz,4,3,dfp); }
+            fwrite(pbr6.data(),4,(size_t)Mv*6,dfp);
+        }
+        fclose(dfp);
+        printf("[7/7] raw dump -> %s (V=%d F=%d PBR=%d @res%d)\n",
+               cfg.dump_post.c_str(), dV, dFc, Mv, res);
+        printf("done in %.1fs -> %s\n", now() - t0, cfg.dump_post.c_str());
+        return 0;
+    }
+
     printf("[7/7] write %s\n", outglb.c_str());
     bool textured = false;
     if (!pbr6.empty()) {   // UV-baked textured GLB (PBR material)
