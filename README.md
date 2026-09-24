@@ -108,19 +108,21 @@ The default is the **1024 cascade** (LR `flow_512` → upsample → HR `flow_102
 res-1024 decode, sharper geometry); `--res 512` selects the lighter res-512 path.
 All behavior is driven by CLI flags — run `trellis-cli --help` for the full list.
 
-For an optional all-quad textured export, configure with
-`TRELLIS_RETOPO_MATCHING=ON` and `TRELLIS_RETOPO_COLLISION=ON`. This build needs
-LEMON 1.3.1 (`TRELLIS_LEMON_SOURCE`, `TRELLIS_LEMON_BUILD`, and
-`TRELLIS_LEMON_LIBRARY`) and CGAL with MPFR/GMP (`TRELLIS_CGAL_PREFIX`). Build
-`trellis-cli` and `trellis-retopo-atlas` together; the prebuilt release binaries
-do not include this optional Linux-only path. Then run, for example:
+For an optional all-quad textured export on Linux, build with both retopology
+options enabled. CMake downloads pinned LEMON, CGAL, Boost, GMP, and MPFR sources
+and builds the required libraries with the project; no separate dependency paths
+or installs are needed. Building `trellis-cli` also builds the retopology driver
+and its helper executables. The prebuilt release binaries omit this optional path.
 
 ```bash
-mkdir -p .codex/retopo/runs
-TMPDIR="$PWD/.codex/retopo/runs" ./build/trellis-cli assets/goblin.png out/goblin-quads.glb \
+cmake -S . -B build -DGGML_VULKAN=ON \
+  -DTRELLIS_RETOPO_MATCHING=ON -DTRELLIS_RETOPO_COLLISION=ON
+cmake --build build --target trellis-cli -j
+mkdir -p out/retopo-work
+TMPDIR="$PWD/out/retopo-work" ./build/trellis-cli assets/goblin.png out/goblin-quads.glb \
   --models /path/to/gguf --seed 42 --res 1024 --tex-res 512 \
   --retopo 512 0 900000 --retopo-no-weld-fill --retopo-dual-pbr \
-  --retopo-atlas 4096 --retopo-workdir .codex/retopo/runs
+  --retopo-atlas 4096 --retopo-workdir out/retopo-work
 ```
 
 The three `--retopo` numbers select the tetra remesh grid, initial QEM face
@@ -130,11 +132,11 @@ with the same 512-grid, no-weld preparation. `--retopo-dual-pbr` requires
 `--res 1024 --tex-res 512`: it decodes a 1024-resolution PBR field for the
 quad atlas when the 512 field leaves texture holes, at extra compute and
 storage cost. The raw POST, intermediate meshes, logs, and acceptance report
-stay in the unique run directory under `--retopo-workdir`. Keep that directory
-on disk (the tested `.codex/retopo` is backed by `/media/extssd`), not on a
-RAM-backed `/tmp`. The requested GLB is published only after the geometry,
-topology, source-cover, exact-UV, and bake gates pass. The standalone
-`trellis-retopo-atlas --from-post` command can resume from an existing POST
+stay in a unique run directory under `--retopo-workdir`. Choose a disk-backed
+location with ample free space for it and `TMPDIR`, particularly if your system
+uses a RAM-backed temporary directory. The requested GLB is published only
+after the geometry, topology, source-cover, exact-UV, and bake gates pass.
+The standalone `trellis-retopo-atlas --from-post` command can resume from an existing POST
 without repeating image generation.
 
 Other useful CLI flags:
