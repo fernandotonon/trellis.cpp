@@ -6,8 +6,10 @@
 #include <intrin.h>
 #endif
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <functional>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -76,7 +78,20 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     {
         const int F = (int)iF;
         std::vector<std::vector<uint64_t>> parts;
-        const int nt = std::max(1u, std::thread::hardware_concurrency());
+        const int hw = (int)std::max(1u, std::thread::hardware_concurrency());
+        // Each worker previously allocated a full res^3 candidate bitset.  At
+        // res=1024 that is 128 MiB per worker, so a 32-thread CPU consumed ~4 GiB
+        // here before any geometry/BVH memory.  Cap only the replication memory;
+        // the OR result and therefore the remesh are bit-for-bit equivalent.
+        const size_t bytes_per_part = cand.size() * sizeof(uint64_t);
+        const size_t parts_budget = (size_t)1024 * 1024 * 1024; // 1 GiB
+        const int mem_workers = bytes_per_part ? (int)std::max<size_t>(1, parts_budget / bytes_per_part) : hw;
+        const int nt = std::max(1, std::min(hw, mem_workers));
+        if (nt < hw) {
+            printf("  [remesh-mem] candidate bitset %.1f MiB/worker, workers %d->%d\n",
+                   bytes_per_part / (1024.0*1024.0), hw, nt);
+            fflush(stdout);
+        }
         parts.assign(nt, {});
         std::vector<std::thread> ts;
         const int chunk = (F + nt - 1) / nt;
@@ -191,6 +206,89 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         return it == vmap.end() ? 1e9f : fvert[it->second];
     };
 
+    if (std::getenv("TRELLIS_REMESH_TETS")) {
+        float min_fraction = 0.0f;
+        if (const char* setting = std::getenv("TRELLIS_TETS_MIN_EDGE_FRACTION")) {
+            char* end = nullptr;
+            min_fraction = std::strtof(setting, &end);
+            if (end == setting || *end || !std::isfinite(min_fraction)
+                || min_fraction < 0.0f || min_fraction >= 0.5f)
+                throw std::invalid_argument("TRELLIS_TETS_MIN_EDGE_FRACTION must be in [0, 0.5)");
+        }
+        static const int PERM[6][3] = {
+            {0,1,2}, {0,2,1}, {1,0,2}, {1,2,0}, {2,0,1}, {2,1,0}
+        };
+        std::unordered_map<uint64_t, int32_t> intersections;
+        intersections.reserve((size_t)Na * 2);
+        size_t clamped_intersections = 0;
+        auto cut = [&](int a, int b) -> int32_t {
+            const uint32_t lo = (uint32_t)std::min(a, b), hi = (uint32_t)std::max(a, b);
+            const uint64_t key = (uint64_t(lo) << 32) | hi;
+            auto it = intersections.find(key);
+            if (it != intersections.end()) return it->second;
+            const float fa = fvert[a], fb = fvert[b];
+            const float raw_t = fa / (fa - fb);
+            const float t = std::clamp(raw_t, min_fraction, 1.0f - min_fraction);
+            clamped_intersections += t != raw_t;
+            const int32_t index = (int32_t)(out.verts.size() / 3);
+            for (int k = 0; k < 3; ++k) {
+                const float coord = vcoord[3*a+k] + t * (vcoord[3*b+k] - vcoord[3*a+k]);
+                out.verts.push_back((coord / res - 0.5f) * scale);
+            }
+            intersections.emplace(key, index);
+            return index;
+        };
+        auto emit = [&](int32_t a, int32_t b, int32_t c, const float* direction) {
+            const float* pa = out.verts.data() + 3*a;
+            const float* pb = out.verts.data() + 3*b;
+            const float* pc = out.verts.data() + 3*c;
+            const float u[3] = {pb[0]-pa[0], pb[1]-pa[1], pb[2]-pa[2]};
+            const float v[3] = {pc[0]-pa[0], pc[1]-pa[1], pc[2]-pa[2]};
+            const float dot = (u[1]*v[2]-u[2]*v[1])*direction[0]
+                            + (u[2]*v[0]-u[0]*v[2])*direction[1]
+                            + (u[0]*v[1]-u[1]*v[0])*direction[2];
+            if (dot < 0) std::swap(b, c);
+            out.faces.push_back(a); out.faces.push_back(b); out.faces.push_back(c);
+        };
+        for (int64_t i = 0; i < Na; ++i) {
+            const int x = acoord[3*i], y = acoord[3*i+1], z = acoord[3*i+2];
+            int corner[8];
+            for (int mask = 0; mask < 8; ++mask)
+                corner[mask] = vmap.at(key3(x + (mask & 1), y + ((mask >> 1) & 1), z + ((mask >> 2) & 1)));
+            for (const auto& perm : PERM) {
+                const int tet[4] = {corner[0], corner[1 << perm[0]],
+                                    corner[(1 << perm[0]) | (1 << perm[1])], corner[7]};
+                int inside[3], outside[3], ni = 0, no = 0;
+                for (int t = 0; t < 4; ++t)
+                    (fvert[tet[t]] < 0 ? inside[ni++] : outside[no++]) = tet[t];
+                if (!ni || !no) continue;
+                float direction[3] = {};
+                for (int j = 0; j < no; ++j)
+                    for (int k = 0; k < 3; ++k) direction[k] += float(vcoord[3*outside[j]+k]) / no;
+                for (int j = 0; j < ni; ++j)
+                    for (int k = 0; k < 3; ++k) direction[k] -= float(vcoord[3*inside[j]+k]) / ni;
+                if (ni == 1) {
+                    emit(cut(inside[0], outside[0]), cut(inside[0], outside[1]),
+                         cut(inside[0], outside[2]), direction);
+                } else if (no == 1) {
+                    emit(cut(outside[0], inside[0]), cut(outside[0], inside[1]),
+                         cut(outside[0], inside[2]), direction);
+                } else {
+                    const int32_t a = cut(inside[0], outside[0]);
+                    const int32_t b = cut(inside[0], outside[1]);
+                    const int32_t c = cut(inside[1], outside[1]);
+                    const int32_t d = cut(inside[1], outside[0]);
+                    emit(a, b, c, direction);
+                    emit(a, c, d, direction);
+                }
+            }
+        }
+        printf("  remesh_tets: %lld active voxels -> V=%d F=%d (edge_fraction=%.4g, clamped=%zu)\n",
+               (long long)Na, out.V(), out.F(), min_fraction, clamped_intersections);
+        fflush(stdout);
+        return out;
+    }
+
     // Dual vertices: plain mean of edge crossings, cell-center fallback; per
     // voxel, ownership of the 3 "far" edges records crossing direction
     // (spec 27 §4.4).
@@ -271,6 +369,28 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         }
     out.faces.resize(qfaces.size());
     for (size_t k = 0; k < qfaces.size(); ++k) out.faces[k] = remap[qfaces[k]];
+
+    if (std::getenv("TRELLIS_DIAG_DC_AMBIGUITY")) {
+        int64_t ambiguous = 0;
+        for (int64_t i = 0; i < Na; ++i) {
+            const int base[3] = {acoord[3*i], acoord[3*i+1], acoord[3*i+2]};
+            for (int axis = 0; axis < 3; ++axis) {
+                int corner[3] = {base[0], base[1], base[2]};
+                ++corner[axis];
+                if (vox.find(key3(corner[0], corner[1], corner[2])) == vox.end()) continue;
+                const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+                auto sign = [&](int du, int dv) {
+                    int p[3] = {corner[0], corner[1], corner[2]};
+                    p[u] += du; p[v] += dv;
+                    return fval(p[0], p[1], p[2]) < 0;
+                };
+                const bool s00 = sign(0, 0), s10 = sign(1, 0);
+                const bool s01 = sign(0, 1), s11 = sign(1, 1);
+                ambiguous += s00 == s11 && s10 == s01 && s00 != s10;
+            }
+        }
+        printf("  remesh_dc: ambiguous shared voxel faces=%lld\n", (long long)ambiguous);
+    }
 
     // Project the dual vertices back onto the input surface (reference:
     // remesh_project=0.9, o_voxel/postprocess.py::to_glb -> remeshing.py §8).

@@ -12,9 +12,13 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
+#include "tri_bvh.h"
+#include "triangle_intersection.h"
 
 namespace trellis {
 
@@ -69,6 +73,17 @@ inline uint64_t pack_cost(int id, float c) { uint32_t b; std::memcpy(&b, &c, 4);
 void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& faces, int& F,
                     float lam_len, float lam_skinny, float thresh) {
     auto vat = [&](int i) -> V3 { return {verts[3*i], verts[3*i+1], verts[3*i+2]}; };
+    const bool preserve_topology = std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
+    const bool collision_guard = std::getenv("TRELLIS_QEM_COLLISION_GUARD") != nullptr;
+    float normal_cos2 = -1.0f;
+    if (const char* setting = std::getenv("TRELLIS_QEM_MAX_NORMAL_CHANGE_DEG")) {
+        char* end = nullptr;
+        const float degrees = std::strtof(setting, &end);
+        if (end == setting || *end || !std::isfinite(degrees) || degrees <= 0.0f || degrees >= 90.0f)
+            throw std::invalid_argument("TRELLIS_QEM_MAX_NORMAL_CHANGE_DEG must be in (0, 90)");
+        const float cosine = std::cos(degrees * 0.01745329251994329577f);
+        normal_cos2 = cosine * cosine;
+    }
 
     // vertex -> incident face adjacency (CSR)
     std::vector<int> off(V + 1, 0);
@@ -95,6 +110,34 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
     }
     const int E = (int)edges.size();
 
+    auto valid_link = [&](int a, int b, uint64_t key) {
+        if (ecount.at(key) != 2) return false;
+        auto neighbors = [&](int vertex) {
+            std::vector<int> result;
+            result.reserve((size_t)(off[vertex+1] - off[vertex]) * 2);
+            for (int j = off[vertex]; j < off[vertex+1]; ++j) {
+                const int f = v2f[j];
+                for (int k = 0; k < 3; ++k) {
+                    const int other = faces[3*f+k];
+                    if (other != vertex) result.push_back(other);
+                }
+            }
+            std::sort(result.begin(), result.end());
+            result.erase(std::unique(result.begin(), result.end()), result.end());
+            return result;
+        };
+        auto left = neighbors(a), right = neighbors(b);
+        size_t i = 0, j = 0;
+        int common = 0;
+        while (i < left.size() && j < right.size()) {
+            if (left[i] == right[j]) { ++common; ++i; ++j; }
+            else if (left[i] < right[j]) ++i;
+            else ++j;
+            if (common > 2) return false;
+        }
+        return common == 2;
+    };
+
     // per-vertex QEM = sum of incident face plane quadrics (normalized normals)
     std::vector<QEM> qem((size_t)V);
     for (int i = 0; i < V; ++i) {
@@ -120,6 +163,11 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
             V3 on = cross(sub(b,a), sub(c,a));
             V3 ne1 = sub(nb,na), ne2 = sub(nc,na), nn = cross(ne1, ne2);
             if (dot(on, nn) < 0.f) return false;               // flip
+            if (normal_cos2 >= 0.0f) {
+                const double product = (double)dot(on, nn);
+                if (!(product > 0.0) || product * product < (double)normal_cos2 * nrm2(on) * nrm2(nn))
+                    return false;
+            }
             float narea = 0.5f * std::sqrt(nrm2(nn));
             float denom = nrm2(sub(nc,nb)) + nrm2(ne1) + nrm2(ne2);
             if (denom < 1e-12f) denom = 1e-12f;
@@ -152,6 +200,10 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
         if (!ok) { cost[t] = std::numeric_limits<float>::infinity(); continue; }
         if (ntri > 0) skinny /= ntri;
         c += lam_skinny * skinny * el2;
+        if (preserve_topology && c <= thresh && !valid_link(e0, e1, edges[t])) {
+            cost[t] = std::numeric_limits<float>::infinity();
+            continue;
+        }
         cost[t] = c;
     }
 
@@ -166,6 +218,7 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
 
     // collapse edges that win every incident face and are under threshold
     std::vector<uint8_t> vdead((size_t)V, 0), fdead((size_t)F, 0);
+    std::vector<int> winners;
     for (int t = 0; t < E; ++t) {
         if (!(cost[t] <= thresh)) continue;
         uint64_t p = pack_cost(t, cost[t]);
@@ -174,6 +227,94 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
         for (int j = off[e0]; j < off[e0+1] && own; ++j) if (prop[v2f[j]] != p) own = false;
         for (int j = off[e1]; j < off[e1+1] && own; ++j) if (prop[v2f[j]] != p) own = false;
         if (!own) continue;
+        winners.push_back(t);
+    }
+
+    std::vector<uint8_t> permitted(winners.size(), 1);
+    if (collision_guard && !winners.empty()) {
+        const TriBvh tree = TriBvh::build(verts.data(), V, faces.data(), F);
+        std::vector<int32_t> affected((size_t)F, -1);
+        struct Query {
+            const std::vector<float>* verts;
+            const std::vector<int32_t>* faces;
+            const std::vector<int32_t>* affected;
+            int32_t stamp;
+            Triangle3 triangle;
+            bool collision = false;
+        };
+        const auto visit = [](void* pointer, int32_t face) -> bool {
+            auto& query = *static_cast<Query*>(pointer);
+            if ((*query.affected)[face] == query.stamp) return true;
+            Triangle3 other{};
+            for (int j = 0; j < 3; ++j) {
+                int32_t vertex = (*query.faces)[3*face+j];
+                for (int k = 0; k < 3; ++k)
+                    other[j][k] = (*query.verts)[3*vertex+k];
+            }
+            if (triangles_overlap_interior(inset_triangle(query.triangle), inset_triangle(other))) {
+                query.collision = true;
+                return false;
+            }
+            return true;
+        };
+        size_t rejected = 0;
+        for (size_t i = 0; i < winners.size(); ++i) {
+            if (i && i % 100000 == 0) {
+                std::printf("  qem collision guard: checked=%zu/%zu rejected=%zu\n", i, winners.size(), rejected);
+                std::fflush(stdout);
+            }
+            const int t = winners[i];
+            const int e0 = (int)(edges[t] >> 32), e1 = (int)(edges[t] & 0xffffffffu);
+            const int32_t stamp = (int32_t)i;
+            for (int endpoint : {e0,e1})
+                for (int j = off[endpoint]; j < off[endpoint+1]; ++j)
+                    affected[v2f[j]] = stamp;
+            Query query{&verts, &faces, &affected, stamp, {}, false};
+            std::vector<Triangle3> proposed;
+            for (int endpoint : {e0,e1}) {
+                for (int j = off[endpoint]; j < off[endpoint+1]; ++j) {
+                    const int face = v2f[j];
+                    if (endpoint == e1
+                        && (faces[3*face] == e0 || faces[3*face+1] == e0 || faces[3*face+2] == e0)) continue;
+                    const bool has0 = faces[3*face] == e0 || faces[3*face+1] == e0 || faces[3*face+2] == e0;
+                    const bool has1 = faces[3*face] == e1 || faces[3*face+1] == e1 || faces[3*face+2] == e1;
+                    if (has0 && has1) continue;
+                    Triangle3 triangle{};
+                    float bmin[3] = {1e30f,1e30f,1e30f}, bmax[3] = {-1e30f,-1e30f,-1e30f};
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const int vertex = faces[3*face+corner];
+                        const V3 point = vertex == e0 || vertex == e1 ? vnew[t] : vat(vertex);
+                        const float values[3] = {point.x,point.y,point.z};
+                        for (int k = 0; k < 3; ++k) {
+                            triangle[corner][k] = values[k];
+                            bmin[k] = std::min(bmin[k], values[k]);
+                            bmax[k] = std::max(bmax[k], values[k]);
+                        }
+                    }
+                    query.triangle = triangle;
+                    if (!tree.visit_overlapping(bmin, bmax, visit, &query)) {
+                        query.collision = true;
+                        break;
+                    }
+                    for (const auto& prior : proposed) {
+                        if (triangles_overlap_interior(inset_triangle(triangle), inset_triangle(prior))) {
+                            query.collision = true;
+                            break;
+                        }
+                    }
+                    if (query.collision) break;
+                    proposed.push_back(triangle);
+                }
+                if (query.collision) break;
+            }
+            if (query.collision) { permitted[i] = 0; ++rejected; }
+        }
+        std::printf("  qem collision guard: candidates=%zu rejected=%zu\n", winners.size(), rejected);
+    }
+    for (size_t i = 0; i < winners.size(); ++i) {
+        if (!permitted[i]) continue;
+        const int t = winners[i];
+        const int e0 = (int)(edges[t] >> 32), e1 = (int)(edges[t] & 0xffffffffu);
         verts[3*e0] = vnew[t].x; verts[3*e0+1] = vnew[t].y; verts[3*e0+2] = vnew[t].z;
         vdead[e1] = 1;
         for (int j = off[e0]; j < off[e0+1]; ++j) { int f = v2f[j]; int* ff = &faces[3*f]; if (ff[0]==e1||ff[1]==e1||ff[2]==e1) fdead[f] = 1; }
@@ -206,21 +347,25 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
     std::vector<int32_t> faces = in_faces;
     int V = V0, F = F0;
     if (F <= target_faces) { ov = verts; of = faces; return; }
+    const bool preserve_topology = std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") != nullptr;
+    const bool bounded_normals = std::getenv("TRELLIS_QEM_MAX_NORMAL_CHANGE_DEG") != nullptr;
+    const bool collision_guard = std::getenv("TRELLIS_QEM_COLLISION_GUARD") != nullptr;
 
 #ifdef TRELLIS_HAVE_GPU_DECIMATE
     // Run the whole simplification on the GPU when a CUDA/HIP backend is built in; on any
     // failure (no device, alloc/kernel error) fall through to the validated CPU path.
-    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    if (!preserve_topology && !bounded_normals && !collision_guard && decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
     // Any message above (e.g. "device kernel image is invalid" when the kernel was
     // built for a different GPU arch — issue #14) is non-fatal: the mesh is still
     // decimated correctly on the CPU below, just slower.
-    fprintf(stderr, "[decimate] GPU decimation unavailable; falling back to the CPU path (output is unaffected)\n");
+    if (!preserve_topology && !bounded_normals && !collision_guard)
+        fprintf(stderr, "[decimate] GPU decimation unavailable; falling back to the CPU path (output is unaffected)\n");
 #endif
 
 #ifdef TRELLIS_HAVE_VK_DECIMATE
     // Same, on a headless Vulkan compute device (used in Vulkan-only builds with no CUDA/HIP
     // kernel). Falls through to the CPU path on any failure or when the device lacks 64-bit atomics.
-    if (decimate_qem_vk(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    if (!preserve_topology && !bounded_normals && !collision_guard && decimate_qem_vk(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
 #endif
 
     float thresh = 1e-8f;

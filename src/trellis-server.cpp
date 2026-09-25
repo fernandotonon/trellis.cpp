@@ -5,8 +5,10 @@
 //                      fields "seed", "resolution" (512/1024/1536), "bg_removal"
 //                      (threshold|birefnet), "uv" (xatlas = default, unique
 //                      chart space; box = faster projection), "band" (narrow-band
-//                      DC remesh band width, default 1 — see --band). Returns
-//                      model/gltf-binary.
+//                      DC remesh band width, default 1 — see --band), "model"
+//                      (trellis|pixal3d — one directory holds both), and for
+//                      pixal3d the camera: "fov" (degrees), "mesh_scale",
+//                      "extend_pixel". Returns model/gltf-binary.
 //
 // Launch-time defaults come from CLI flags (see trellis::parse_args);
 // each request copies those defaults and applies its own overrides. The model
@@ -22,7 +24,9 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <utility>
 #include <string>
+#include <stdexcept>
 
 namespace {
 
@@ -40,11 +44,14 @@ bool write_file_bytes(const std::string& path, const std::string& data) {
 
 // std::tmpnam on MSVC yields drive-root paths ("\sXXX.N") that a non-elevated
 // process cannot write; stage scratch files in the real temp directory instead.
-std::string temp_stem() {
+std::string temp_stem(const std::string& workdir = {}) {
     static std::atomic<unsigned> counter{0};
     std::error_code ec;
-    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    std::filesystem::path dir = workdir.empty() ? std::filesystem::temp_directory_path(ec)
+                                                : std::filesystem::absolute(workdir);
     if (ec) dir = ".";
+    std::filesystem::create_directories(dir,ec);
+    if (ec) throw std::runtime_error("cannot create request workdir: " + ec.message());
     auto n = counter.fetch_add(1);
     return (dir / ("trellis-req-" + std::to_string(n))).string();
 }
@@ -99,13 +106,40 @@ int main(int argc, char** argv) {
         if (req.has_file("bg_removal")) p.birefnet = (req.get_file_value("bg_removal").content == "birefnet") ? 1 : 0;
         if (req.has_file("uv")) p.xatlas = (req.get_file_value("uv").content == "xatlas");
         if (req.has_file("band")) p.band = atoi(req.get_file_value("band").content.c_str());
+        // Both families share one model directory (the Pixal3D flows carry a pixal3d_ prefix),
+        // so a single resident server can serve either -- the client just has to say which.
+        if (req.has_file("model")) {
+            const std::string& m = req.get_file_value("model").content;
+            if      (m == "pixal3d") p.family = trellis::ModelFamily::Pixal3D;
+            else if (m == "trellis") p.family = trellis::ModelFamily::Trellis;
+            else { res.status = 400; res.set_content("model must be trellis or pixal3d\n", "text/plain"); return; }
+        }
+        // Camera, for pixal3d. Unlike every other knob these describe the IMAGE rather than the
+        // run, so a launch-time default is close to useless on a server taking arbitrary uploads.
+        for (const auto& field : {std::pair<const char*, const char*>{"fov", "fov"},
+                                  {"mesh_scale", "mesh-scale"}, {"extend_pixel", "extend-pixel"}}) {
+            if (!req.has_file(field.first)) continue;
+            std::string error;
+            if (!trellis::parse_camera_arg(field.second, req.get_file_value(field.first).content.c_str(), p, error)) {
+                res.status = 400;
+                res.set_content(error + "\n", "text/plain");
+                return;
+            }
+        }
         if (req.has_file("webp")) {
             const std::string& w = req.get_file_value("webp").content;
             p.webp = (w == "off" || w == "0" || w == "false") ? 0
                    : (w == "on"  || w == "1" || w == "true")  ? 1 : -1;
         }
 
-        const std::string stem = temp_stem();
+        std::string stem;
+        try {
+            stem = temp_stem(p.retopo ? p.retopo_workdir : std::string{});
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content("{\"error\":\"failed to stage request files\"}", "application/json");
+            return;
+        }
         p.image  = stem + ".png";
         p.output = stem + ".glb";
 

@@ -20,6 +20,10 @@ public:
     static TriBvh build(const float* verts, int64_t V, const int32_t* faces, int64_t F);
 
     Hit closest(const float p[3], float max_dist = 1e30f) const;
+    using PointFilter = bool (*)(void *, int32_t, const float[3]);
+    Hit closest_filtered(const float p[3], PointFilter accept, void *context, float max_dist) const;
+    using BoxVisitor = bool (*)(void *, int32_t);
+    bool visit_overlapping(const float bmin[3], const float bmax[3], BoxVisitor visit, void *context) const;
     bool empty() const { return nodes_.empty(); }
 
 private:

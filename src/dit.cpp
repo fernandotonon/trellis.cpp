@@ -1,10 +1,14 @@
 #include "dit.h"
 #include "trellis_model.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
 namespace trellis {
@@ -17,9 +21,24 @@ static bool g_cast_f32 = false;   // set per build_dit_dense call
 // Bounds the peak regardless of Lq, which is what made FA necessary in the first place.
 static constexpr int64_t kAttnChunkBytes = 1024ll * 1024 * 1024;
 bool g_no_fa = false;             // --no-fa; set by trellis_run
+int  g_fa_fast = -1;              // auto backend/env; CLI/server may resolve to 0 or 1
+
+static std::string ne_str(const T* t) {
+    std::string s = "[";
+    for (int i = 0; i < 4 && t->ne[i] > 1; ++i) s += (i ? ", " : "") + std::to_string(t->ne[i]);
+    return s + "]";
+}
 
 static T* lin(ggml_context* c, const Model& m, const std::string& p, T* x) {
     T* w = m.get(p + ".weight");
+    // A GGUF whose layout does not match what this graph assumes reaches ggml as a bare
+    // GGML_ASSERT(ggml_can_mul_mat) and a core dump, naming neither the tensor nor the shapes.
+    // Since third-party conversions are a normal way to obtain these weights, say what broke.
+    if (w->ne[0] != x->ne[0])
+        throw std::runtime_error("dit: " + p + ".weight expects an input width of " +
+                                 std::to_string(w->ne[0]) + " but the activation is " +
+                                 std::to_string(x->ne[0]) + " wide (weight ne=" + ne_str(w) +
+                                 ", input ne=" + ne_str(x) + ")");
     if (g_cast_f32 && w->type == GGML_TYPE_F16) w = ggml_cast(c, w, GGML_TYPE_F32);
     T* y = ggml_mul_mat(c, w, x);
     if (T* b = m.try_get(p + ".bias")) y = ggml_add(c, y, b);
@@ -65,8 +84,8 @@ static T* apply_rope(ggml_context* c, T* x, T* cos, T* sin) {
 // An FA padding mask [Lk_pad, Lq] (F16): 0 for real keys (< Lk_real), a large negative for the
 // zero-padded tail. WITHOUT it, ggml's CUDA FlashAttention folds the (zero) padded keys into the
 // softmax; on the >=1024-token HR flow that path NaNs a subset of queries (props, <1024 tokens, dodge
-// it). WITH it the kernel masks/skips the padded KV tiles -> correct softmax, no NaN. Built once per
-// flow (same N every block) and threaded into every attention; -30000 (not -inf) so 0*mask can't NaN.
+// it). WITH it the kernel masks/skips the padded KV tiles -> correct softmax, no NaN. Large flows build
+// this per QUERY CHUNK (not full Lq) so the mask stays bounded; -30000 (not -inf) so 0*mask can't NaN.
 static T* build_pad_mask(ggml_context* c, int64_t Lk_real, int64_t Lq) {
     const int64_t KQ = 256;
     const int64_t Lk_pad = ((Lk_real + KQ - 1) / KQ) * KQ;
@@ -84,7 +103,17 @@ static T* build_pad_mask(ggml_context* c, int64_t Lk_real, int64_t Lq) {
 }
 
 // SDPA over heads. q:[hd,nh,Lq]  k,v:[hd,nh,Lk] -> [d_model, Lq].  `mask`: optional [Lk_pad,Lq] F16.
-static T* sdpa(ggml_context* c, T* q, T* k, T* v, int d_model, T* mask = nullptr) {
+static bool model_backend_is_htp(const Model& m) {
+    const char* name = m.backend ? ggml_backend_name(m.backend) : nullptr;
+    const std::string backend = name ? name : "";
+    return backend.size() >= 3 &&
+           std::tolower((unsigned char)backend[0]) == 'h' &&
+           std::tolower((unsigned char)backend[1]) == 't' &&
+           std::tolower((unsigned char)backend[2]) == 'p';
+}
+
+static T* sdpa(ggml_context* c, const Model& m, T* q, T* k, T* v,
+               int d_model, T* mask = nullptr) {
     const float scale = 1.0f / std::sqrt((float)q->ne[0]);
     // FlashAttention: a fused, tiled SDPA that never materialises the [Lk,Lq,nh] score
     // matrix — O(N) memory instead of O(N^2). That score buffer is exactly what OOMs the
@@ -116,12 +145,24 @@ static T* sdpa(ggml_context* c, T* q, T* k, T* v, int d_model, T* mask = nullptr
     // reads only -0.0019 vs -0.00014 (its oracle is -0.00010). MMA already accumulated KQ in
     // FP32, so only the VKQ sum stagnated there -- same bug, ~9x milder.
     // --no-fa falls back to the exact chunked path (correct on any backend, ~2.7x slower).
-    const bool no_fa = g_no_fa;
+    // FlashAttention exists here to avoid materialising the [Lk, Lq, nh] score matrix, which is
+    // terabytes at the HR flow. When Lk is shorter than one FA key tile that matrix is trivially
+    // small and FA buys nothing — while costing a great deal of risk. Pixal3D's proj mode
+    // cross-attends over 5 global tokens, so the key dim gets zero-padded 5 -> 256: 98% padding,
+    // a regime TRELLIS.2 (1029 or 4101 keys) never reaches, and precisely the shape whose mask
+    // handling the comments below record as fragile and token-count dependent. Take the exact
+    // path instead; at Lk = 5 it is cheaper than FA anyway.
+    const bool no_fa = g_no_fa || k->ne[2] < 256;
     if (!no_fa) {
-        // TRELLIS_FA_FAST=1: F16 K/V + default (F16) accumulation — the shapes
-        // the Vulkan coopmat FA shaders are specialized for. A/B only: F16 K/V
-        // can overflow on HR activations (the reason BF16+F32 is the default).
-        static const bool fa_fast = std::getenv("TRELLIS_FA_FAST") != nullptr;
+        // Fast mode uses F16 K/V + the backend's default accumulation. It is the HTP
+        // default after the 12-step res512 gate showed a 3.53x end-to-end speedup with
+        // identical sparse voxels and 1.5% decoded-voxel drift. Other backends retain
+        // BF16 K/V + F32 accumulation unless explicitly forced. Test binaries that do
+        // not enter trellis_run keep the historical TRELLIS_FA_FAST environment switch.
+        const bool fa_fast = g_fa_fast >= 0 ? g_fa_fast != 0
+                           : std::getenv("TRELLIS_FA_F32") ? false
+                           : std::getenv("TRELLIS_FA_FAST") ? true
+                           : model_backend_is_htp(m);
         const int64_t KQ_STRIDE = 256;
         auto prep_kv = [&](T* x) {                              // -> [hd, Lk_pad, nh] BF16
             T* p = ggml_cont(c, ggml_permute(c, x, 0, 2, 1, 3));   // [hd, Lk, nh] F32
@@ -138,10 +179,52 @@ static T* sdpa(ggml_context* c, T* q, T* k, T* v, int d_model, T* mask = nullptr
         // ignored and the zero-padded keys are diluting the softmax (exp(0-rowmax) is only
         // negligible when rowmax >> 0), which shrinks every output toward zero.
         static const bool fa_nomask = std::getenv("TRELLIS_FA_NOMASK") != nullptr;
-        T* out = ggml_flash_attn_ext(c, qf, kf, vf, fa_nomask ? nullptr : mask, scale, 0.0f, 0.0f);  // [hd, nh, Lq]
-        if (!fa_fast) ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out = ggml_scale(c, out, 1.0f / V_SCALE);
-        return ggml_reshape_2d(c, out, d_model, out->ne[2]);   // [d_model, Lq]
+
+        // IMPORTANT: the padding mask depends only on KEY index, but ggml FlashAttention
+        // requires it expanded to [Lk_pad, Lq_pad]. At 37,017 self-attention tokens that one
+        // F16 tensor is exactly 2,751,037,440 bytes -- the allocation seen in the real failure
+        // log. FlashAttention itself is tiled, so do the same for the mask: attention is
+        // independent per query, therefore query chunks are mathematically identical while
+        // reducing the mask from O(Lq*Lk) residency to O(nq*Lk).
+        const int64_t hd = qf->ne[0], Lq = qf->ne[1], nh = qf->ne[2];
+        const int64_t Lk_real = k->ne[2];
+        const int64_t Lk_pad = ((Lk_real + KQ_STRIDE - 1) / KQ_STRIDE) * KQ_STRIDE;
+        static constexpr int64_t kDefaultFaMaskChunkBytes = 256ll * 1024 * 1024;
+        int64_t mask_budget = kDefaultFaMaskChunkBytes;
+        if (const char* e = getenv("TRELLIS_FA_MASK_CHUNK_MB")) {
+            const int64_t mb = atoll(e);
+            if (mb > 0) mask_budget = mb * 1024 * 1024;
+        }
+        int64_t nq = Lq;
+        if (!fa_nomask) {
+            const int64_t bytes_per_q = std::max<int64_t>(1, Lk_pad * (int64_t)sizeof(uint16_t));
+            nq = std::max<int64_t>(1, mask_budget / bytes_per_q);
+            // FA's mask reader works in 64-query tiles. Round ordinary chunks down to a
+            // multiple of 64 so only the final chunk needs padding.
+            if (nq >= 64 && nq < Lq) nq = (nq / 64) * 64;
+            if (nq > Lq) nq = Lq;
+        }
+
+        T* out_all = nullptr;
+        for (int64_t q0 = 0; q0 < Lq; q0 += nq) {
+            const int64_t n = std::min<int64_t>(nq, Lq - q0);
+            T* qc = (n == Lq)
+                ? qf
+                : ggml_cont(c, ggml_view_3d(c, qf, hd, n, nh,
+                                             qf->nb[1], qf->nb[2], (size_t)q0 * qf->nb[1]));
+            T* cmask = nullptr;
+            if (!fa_nomask) {
+                // A caller-supplied mask is only safe to reuse when this attention was not
+                // query-chunked. build_dit_dense no longer creates the giant full mask.
+                cmask = (mask && n == Lq) ? mask : build_pad_mask(c, Lk_real, n);
+            }
+            T* o = ggml_flash_attn_ext(c, qc, kf, vf, cmask, scale, 0.0f, 0.0f); // [hd,nh,n]
+            if (!fa_fast) ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            o = ggml_scale(c, o, 1.0f / V_SCALE);
+            o = ggml_reshape_2d(c, o, d_model, o->ne[2]);          // [d_model,n]
+            out_all = out_all ? ggml_concat(c, out_all, o, 1) : o;
+        }
+        return out_all;                                           // [d_model,Lq]
     }
     // Exact SDPA, chunked over QUERIES. The whole reason FA exists here is the [Lk, Lq, nh]
     // score matrix -- at the HR flow that is 15104*15006*12*4 = 10.9 TB, so it cannot be
@@ -202,7 +285,7 @@ static T* self_attn(ggml_context* c, const Model& m, const std::string& pre, T* 
     k = rms_gamma(c, k, gamma32(c, m, pre + ".k_rms_norm.gamma"), p.rms_eps);
     q = apply_rope(c, q, cos, sin);
     k = apply_rope(c, k, cos, sin);
-    return lin(c, m, pre + ".to_out", sdpa(c, q, k, v, p.d_model, mask));
+    return lin(c, m, pre + ".to_out", sdpa(c, m, q, k, v, p.d_model, mask));
 }
 
 static T* cross_attn(ggml_context* c, const Model& m, const std::string& pre, T* h, T* cond,
@@ -220,7 +303,7 @@ static T* cross_attn(ggml_context* c, const Model& m, const std::string& pre, T*
     T* k = pick(0); T* v = pick(1);
     q = rms_gamma(c, q, gamma32(c, m, pre + ".q_rms_norm.gamma"), p.rms_eps);
     k = rms_gamma(c, k, gamma32(c, m, pre + ".k_rms_norm.gamma"), p.rms_eps);
-    return lin(c, m, pre + ".to_out", sdpa(c, q, k, v, p.d_model, mask));
+    return lin(c, m, pre + ".to_out", sdpa(c, m, q, k, v, p.d_model, mask));
 }
 
 // x*(1+scale)+shift, scale/shift: [d_model] broadcast over L
@@ -228,7 +311,7 @@ static T* modulate(ggml_context* c, T* x, T* scale, T* shift) {
     return ggml_add(c, ggml_add(c, x, ggml_mul(c, x, scale)), shift);
 }
 
-static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond,
+static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond, T* proj,
                 T* cos, T* sin, const DiTParams& p, std::map<std::string, T*>* inter = nullptr,
                 T* self_mask = nullptr, T* cross_mask = nullptr) {
     const std::string b = "blocks." + std::to_string(i);
@@ -246,7 +329,15 @@ static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond,
     h = ggml_add(c, h, ggml_mul(c, hh, gate_msa));
 
     hh = layernorm(c, h, p.ln_eps, m.get(b + ".norm2.weight"), m.get(b + ".norm2.bias"));
-    hh = cross_attn(c, m, b + ".cross_attn", hh, cond, p, cross_mask);
+    if (p.proj_mode) {
+        // ProjectAttention: cross_attn_block(h, global_tokens) + proj_linear(view_aligned).
+        // The sum REPLACES the cross-attention output as the residual branch (both the dense
+        // and the sparse Pixal3D modules do exactly this), so the add below is unchanged.
+        hh = cross_attn(c, m, b + ".cross_attn.cross_attn_block", hh, cond, p, cross_mask);
+        hh = ggml_add(c, hh, lin(c, m, b + ".cross_attn.proj_linear", proj));
+    } else {
+        hh = cross_attn(c, m, b + ".cross_attn", hh, cond, p, cross_mask);
+    }
     dbg("blk0_cross", hh);
     h = ggml_add(c, h, hh);
 
@@ -261,9 +352,10 @@ static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond,
 }
 
 ggml_tensor* build_dit_dense(ggml_context* c, const Model& m, const DiTParams& p,
-                             T* h0, T* tfreq, T* cond, T* cos, T* sin,
+                             T* h0, T* tfreq, T* cond, T* proj, T* cos, T* sin,
                              std::map<std::string, T*>* inter) {
     g_cast_f32 = p.cast_f32;
+    if (p.proj_mode && !proj) throw std::runtime_error("build_dit_dense: proj mode needs a proj input");
     auto keep = [&](const char* n, T* t) { if (inter) (*inter)[n] = t; ggml_set_name(t, n); return t; };
 
     T* h = lin(c, m, "input_layer", h0);                       // [d_model, L]
@@ -275,13 +367,11 @@ ggml_tensor* build_dit_dense(ggml_context* c, const Model& m, const DiTParams& p
     T* mod = lin(c, m, "adaLN_modulation.1", ggml_silu(c, te));// [6*d_model]
     keep("t_emb_mod", mod);
 
-    // Padding masks for the two attentions, built ONCE (token counts are fixed across blocks) and
-    // shared by every block — they tell the CUDA FlashAttention to exclude the zero-padded key tiles
-    // (else the >=1024-token flow NaNs a subset of queries). self: Lk=L (the latent); cross: Lk=Lc.
-    T* self_mask  = build_pad_mask(c, h0->ne[1], h0->ne[1]);
-    T* cross_mask = build_pad_mask(c, cond->ne[1], h0->ne[1]);
+    // FlashAttention padding masks used to be built once at full [Lk_pad,Lq_pad] size.
+    // That becomes a 2.75 GB single tensor at 37,017 tokens. sdpa() now creates an identical
+    // mask per QUERY CHUNK, so there is deliberately no full-flow mask tensor here.
     for (int i = 0; i < p.n_blocks; ++i) {
-        h = block(c, m, i, h, mod, cond, cos, sin, p, inter, self_mask, cross_mask);
+        h = block(c, m, i, h, mod, cond, proj, cos, sin, p, inter, nullptr, nullptr);
         if (i == 0) keep("after_block0", h);
         if (i == 1) keep("after_block1", h);
         if (i == p.n_blocks - 1) keep("after_block29", h);

@@ -9,8 +9,19 @@ namespace trellis {
 // binaries (which don't parse args) keep their historical TRELLIS_* behavior.
 extern bool g_sparse_cast_f32;  // defined in sparse.cpp        (TRELLIS_F32)
 extern bool g_no_fa;            // defined in dit.cpp           (TRELLIS_NOFA)
+extern int  g_fa_fast;          // defined in dit.cpp: -1 auto/env, 0 BF16/F32, 1 F16/fast
 extern bool g_require_gpu;      // defined in trellis_model.cpp (TRELLIS_REQUIRE_GPU)
 extern int  g_cpu_threads;      // defined in trellis_model.cpp (TRELLIS_THREADS)
+extern std::string g_backend;   // defined in trellis_model.cpp (TRELLIS_BACKEND)
+
+// Which family of flow weights the GGUF directory holds. Both share the TRELLIS.2 DiT,
+// sampler and decoders; they differ only in how the image conditions the flow — see pixal3d.h.
+enum class ModelFamily {
+    Trellis,   // TRELLIS.2: cross-attention over every DINOv3 token
+    Pixal3D,   // Pixal3D: 5 global tokens + per-token view-aligned projection
+};
+
+const char* model_family_name(ModelFamily f);
 
 // Every knob for one TRELLIS.2 image->3D run. Resolved as default -> environment
 // (the historical TRELLIS_* / GSS / GSH names) -> CLI flag, with the CLI winning.
@@ -24,7 +35,29 @@ struct TrellisParams {
     std::string host   = "127.0.0.1";                           // trellis-server only
     int      port = 8080;                                       // trellis-server only
     int      gpu  = 0;                                          // >=0 GPU index, <0 CPU
+    std::string backend;        // force a ggml backend by name ("Vulkan", "HTP",
+                                // "CPU", ...); empty = auto-select. --gpu N then indexes
+                                // within that backend's devices.
+    int threads = 0;            // CPU backend thread count; 0 = auto (all cores).
+                                // ggml's own default is GGML_DEFAULT_N_THREADS == 4.
     uint32_t seed = 0;
+
+    ModelFamily family = ModelFamily::Trellis;   // --model trellis|pixal3d
+    // Pixal3D only. The projection needs the camera the image was "taken" with: upstream
+    // estimates the horizontal FOV with MoGe-2 and derives the distance from it in closed form.
+    // MoGe-2 is not ported, so the FOV is a flag; 0 keeps Pixal3D's own default (49.13 deg).
+    float fov_deg    = 0.0f;
+    float mesh_scale = 1.0f;
+    // Pushes the camera's virtual image border outward, so the projection grid spans more than
+    // the frame. The reference's own `extend_pixel`, which upstream never exposes. Rarely useful
+    // here: background removal already reframes around the subject's alpha bbox, and grid cells
+    // pushed past the cutout sample the border clamp — unconditioned, and the model fills them
+    // arbitrarily.
+    int extend_pixel = 0;
+    // NAF guided upsampling of the DINOv3 feature map (the shape/texture stages' second proj
+    // branch). Off falls back to sampling the bare feature map twice, which halves the effective
+    // proj input — accepted only as a way to run without naf.gguf.
+    bool naf = true;
 
     bool cascade    = true;     // 1024 cascade (default); --res 512 selects the light path
     int  hr_res     = 1024;     // HR cascade target resolution (1024 / 1536)
@@ -51,8 +84,8 @@ struct TrellisParams {
     int  webp     = -1;         // GLB texture encoding: -1 auto (WebP if built with it), 1 on, 0 off (PNG)
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
+    int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast
     bool require_gpu = false;   // refuse CPU fallback if no GPU is usable
-    int  threads  = 0;          // CPU backend thread count; 0 = all cores
     float gss = 7.5f;           // sparse-structure guidance strength
     float gsh = 7.5f;           // shape-SLAT guidance strength
     bool voxply = false;        // dump out/myvox.ply              (debug)
@@ -65,6 +98,27 @@ struct TrellisParams {
                                 // i32 faces[F*3]; i32 coords[Mv*3]; f32 pbr6[Mv*6];
                                 // same layout as the TRELLIS_DUMP_POST debug env)
     bool bg_only = false;       // background removal only: write the cutout and skip the rest
+
+    int  steps    = 0;          // flow sampler steps; 0 = model default (12). Lowering this
+                                //   trades output quality for turnaround and is meant for
+                                //   backend bring-up: a CPU and an NPU run at the same low
+                                //   step count are still directly comparable to each other.
+    int  sched = -1;            // multi-backend scheduler: -1 auto (on unless the primary
+                                // backend is the CPU), 0 off, 1 on. Required for partial
+                                // op-coverage accelerators like the Hexagon NPU.
+    int  vulkan_fallback = -1;   // add Vulkan between HTP and CPU: -1 environment/default,
+                                // 0 disabled, 1 enabled
+    bool verbose = false;       // --verbose: per-stage timings, graph shapes, and a
+                                // heartbeat while a backend compute is in flight
+
+    bool retopo = false;
+    int retopo_grid = 0;
+    int retopo_first_faces = 0;
+    int retopo_final_faces = 0;
+    int retopo_atlas = 4096;
+    bool retopo_no_weld_fill = false;
+    bool retopo_dual_pbr = false;
+    std::string retopo_workdir = ".codex/retopo/runs";
 
     bool help = false;          // --help requested
 
@@ -81,5 +135,6 @@ void print_usage(const char* argv0, bool server);
 // (non-flag) positionals fill `image` then `output`. Returns false on a parse
 // error OR when --help was requested; check p.help to tell them apart.
 bool parse_args(int argc, char** argv, TrellisParams& p);
+bool parse_camera_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error);
 
 }  // namespace trellis

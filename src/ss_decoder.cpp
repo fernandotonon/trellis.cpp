@@ -1,5 +1,7 @@
 #include "ss_decoder.h"
 #include "trellis_model.h"
+#include "trellis_debug.h"
+#include "trellis_sched.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -65,12 +67,12 @@ static Seg run_seg(const Model& m, const std::vector<float>& in_host,
     T* out = build(c, in); ggml_set_output(out);
     ggml_cgraph* g = ggml_new_graph_custom(c, 8192, false);
     ggml_build_forward_expand(g, out);
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!ggml_gallocr_alloc_graph(alloc, g)) throw std::runtime_error("ss_dec: alloc failed");
+    trellis::GraphExec ex(m);
+    if (!ex.alloc(g)) throw std::runtime_error("ss_dec: alloc failed");
     ggml_backend_tensor_set(in, in_host.data(), 0, in_host.size() * 4);
-    if (ggml_backend_graph_compute(m.backend, g) != GGML_STATUS_SUCCESS) throw std::runtime_error("ss_dec: compute failed");
+    if (ex.compute(g, "ss_decode") != GGML_STATUS_SUCCESS) throw std::runtime_error("ss_dec: compute failed");
     Seg s; s.data = tensor_to_f32(out);
-    ggml_gallocr_free(alloc); ggml_free(c);
+    ggml_free(c);
     return s;
 }
 

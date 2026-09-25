@@ -1,6 +1,7 @@
 // UV unwrap (xatlas) + bake voxel-volume PBR into texture images.
 #pragma once
 #include <array>
+#include <cstddef>
 #include <vector>
 #include <cstdint>
 
@@ -106,5 +107,17 @@ BakedMesh uv_box_project(const std::vector<float>& verts, int V, const std::vect
 // area-proportional texel density. Fallback when xatlas times out or is skipped.
 BakedMesh uv_chart_project(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                            const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox = nullptr);
+
+struct PresetUvBakeStats {
+    size_t covered_texels = 0;
+    size_t missing_voxel_texels = 0;
+    size_t projected_samples = 0;
+    size_t projected_samples_above_0_008 = 0;
+    double maximum_source_distance = 0;
+};
+
+// Shade an already-unwrapped triangle mesh from the sparse PBR volume. The caller
+// must validate UV overlap and quad-corner continuity before exporting quads.
+PresetUvBakeStats bake_preset_uv(BakedMesh& mesh, const VoxelPbr& vox);
 
 } // namespace trellis

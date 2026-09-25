@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(trellis_cpp VERSION 0.6.0 LANGUAGES CXX C)
+project(trellis_cpp VERSION 0.8.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,27 +89,94 @@ endif()
 
 # --- core library ----------------------------------------------------------
 add_library(trellis_core STATIC
+  src/trellis_debug.cpp
+  src/trellis_sched.cpp
   src/trellis_model.cpp
   src/dit.cpp
   src/flow_runner.cpp
   src/ss_decoder.cpp
   src/mesh_glb.cpp
   src/dinov3.cpp
+  src/pixal3d.cpp
+  src/naf.cpp
   src/sparse.cpp
   src/shape_decoder.cpp
   src/dual_grid.cpp
   src/preprocess.cpp
   src/uv_bake.cpp
+  src/uv_overlap_cover.cpp
   src/birefnet.cpp
   thirdparty/xatlas/xatlas.cpp
   thirdparty/meshoptimizer/simplifier.cpp
   src/tri_bvh.cpp
   src/remesh_dc.cpp
   src/decimate_qem.cpp
+  src/mesh_shape.cpp
+  src/quad_refinement.cpp
+  src/quad_refinement_gates.cpp
+  src/quad_refinement_io.cpp
+  src/quad_components.cpp
+  src/quad_topology.cpp
+  src/quad_component_cover.cpp
 )
 target_include_directories(trellis_core PUBLIC include ${GGML_DIR}/include ${CMAKE_SOURCE_DIR}/thirdparty/stb ${CMAKE_SOURCE_DIR}/thirdparty/xatlas ${CMAKE_SOURCE_DIR}/thirdparty/meshoptimizer ${CMAKE_SOURCE_DIR}/thirdparty/fqms)
 target_compile_definitions(trellis_core PRIVATE TRELLIS_GIT_COMMIT="${TRELLIS_GIT_COMMIT}" TRELLIS_GIT_DIRTY=${TRELLIS_GIT_DIRTY} TRELLIS_BUILD_TIMESTAMP="${TRELLIS_BUILD_TIMESTAMP_UTC}" TRELLIS_APP_VERSION="${TRELLIS_APP_VERSION}")
 target_link_libraries(trellis_core PUBLIC ggml ggml-base ggml-cpu)
+
+add_executable(trellis-refine-core tools/mesh_quad_matching/selective_refinement_core.cpp)
+target_link_libraries(trellis-refine-core PRIVATE trellis_core)
+add_executable(trellis-chart-quads tools/mesh_quad_matching/chart_quad_uv.cpp)
+target_link_libraries(trellis-chart-quads PRIVATE trellis_core)
+add_executable(trellis-repack-uv tools/mesh_quad_matching/repack_uv.cpp)
+target_link_libraries(trellis-repack-uv PRIVATE trellis_core)
+add_executable(trellis-audit-quad-uv tools/mesh_quad_matching/audit_quad_uv_core.cpp)
+target_link_libraries(trellis-audit-quad-uv PRIVATE trellis_core)
+add_executable(trellis-bake-quads tools/mesh_quad_matching/bake_current_quad_probe.cpp)
+target_link_libraries(trellis-bake-quads PRIVATE trellis_core)
+add_executable(trellis-audit-bake-fidelity tools/mesh_quad_matching/audit_bake_fidelity.cpp)
+target_link_libraries(trellis-audit-bake-fidelity PRIVATE trellis_core)
+add_executable(trellis-select-uv-overlap-cover tools/mesh_quad_matching/select_uv_overlap_cover.cpp)
+target_link_libraries(trellis-select-uv-overlap-cover PRIVATE trellis_core)
+add_executable(trellis-filter-quads tools/mesh_quad_matching/filter_quad_components_core.cpp)
+target_link_libraries(trellis-filter-quads PRIVATE trellis_core)
+add_executable(trellis-test-quad-component-cover src/test_quad_component_cover.cpp)
+target_link_libraries(trellis-test-quad-component-cover PRIVATE trellis_core)
+add_executable(trellis-audit-quad-topology tools/mesh_quad_matching/audit_quad_topology.cpp)
+target_link_libraries(trellis-audit-quad-topology PRIVATE trellis_core)
+add_executable(trellis-test-quad-topology src/test_quad_topology.cpp)
+target_link_libraries(trellis-test-quad-topology PRIVATE trellis_core)
+
+option(TRELLIS_RETOPO_MATCHING "Build the native quad-matching stage" OFF)
+option(TRELLIS_RETOPO_COLLISION "Build the exact collision-safe quad matcher" OFF)
+if(TRELLIS_RETOPO_COLLISION AND NOT TRELLIS_RETOPO_MATCHING)
+  message(FATAL_ERROR "TRELLIS_RETOPO_COLLISION requires TRELLIS_RETOPO_MATCHING")
+endif()
+if(TRELLIS_RETOPO_MATCHING)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Native retopology is currently supported on Linux only")
+  endif()
+  include(thirdparty/retopo-dependencies.cmake)
+  add_library(trellis_quad_matching STATIC src/quad_matching.cpp)
+  target_include_directories(trellis_quad_matching PUBLIC include)
+  target_compile_definitions(trellis_quad_matching PUBLIC TRELLIS_HAVE_QUAD_MATCHING)
+  target_link_libraries(trellis_quad_matching PUBLIC trellis_lemon)
+  if(TRELLIS_RETOPO_COLLISION)
+    target_sources(trellis_quad_matching PRIVATE src/quad_collision.cpp src/quad_local_repair.cpp)
+    target_link_libraries(trellis_quad_matching PRIVATE trellis_cgal_deps)
+    add_dependencies(trellis_quad_matching trellis_mpfr_build)
+    target_compile_definitions(trellis_quad_matching PUBLIC TRELLIS_HAVE_QUAD_COLLISION)
+    add_executable(trellis-repair-core tools/mesh_quad_matching/local_quad_repair_core.cpp)
+    target_link_libraries(trellis-repair-core PRIVATE trellis_core)
+    add_executable(trellis-audit-uv tools/mesh_quad_matching/audit_uv.cpp)
+    target_link_libraries(trellis-audit-uv PRIVATE trellis_core trellis_cgal_deps)
+    add_dependencies(trellis-audit-uv trellis_mpfr_build)
+    add_executable(trellis-retopo-atlas tools/mesh_quad_matching/retopo_atlas_pipeline.cpp)
+    target_link_libraries(trellis-retopo-atlas PRIVATE trellis_core)
+  endif()
+  target_link_libraries(trellis_core PUBLIC trellis_quad_matching)
+  add_executable(trellis-match-core tools/mesh_quad_matching/constrained_matching_core.cpp)
+  target_link_libraries(trellis-match-core PRIVATE trellis_quad_matching)
+endif()
 
 # --- WebP textures (reference-parity GLB export) ---------------------------
 # Optional lossy-WebP textures via EXT_texture_webp. The exporter only advertises
@@ -252,6 +319,14 @@ if(TARGET ggml-hip)
   if(NOT CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES "${TRELLIS_HIP_ARCH}")
   endif()
+  # Targets created before HIP was enabled also link trellis_core's HIP objects.
+  get_property(TRELLIS_EARLY_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(TRELLIS_EARLY_TARGET IN LISTS TRELLIS_EARLY_TARGETS)
+    get_target_property(TRELLIS_EARLY_TYPE ${TRELLIS_EARLY_TARGET} TYPE)
+    if(TRELLIS_EARLY_TYPE STREQUAL "EXECUTABLE")
+      set_target_properties(${TRELLIS_EARLY_TARGET} PROPERTIES HIP_ARCHITECTURES "${TRELLIS_HIP_ARCH}")
+    endif()
+  endforeach()
   # Both the QEM decimation kernel and BiRefNet's deformable conv (issue #20) build
   # as HIP so ROCm users get GPU BiRefNet instead of the minutes-long CPU fallback.
   set_source_files_properties(src/decimate_qem.cu src/deform_conv.cu PROPERTIES LANGUAGE HIP)
@@ -271,6 +346,10 @@ target_compile_definitions(trellis_core PRIVATE TRELLIS_BUILD_BACKEND="${TRELLIS
 add_executable(trellis-smoke src/smoke_test.cpp)
 target_link_libraries(trellis-smoke PRIVATE trellis_core)
 set_target_properties(trellis-smoke PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
+add_executable(trellis-devices src/list_devices.cpp)
+target_link_libraries(trellis-devices PRIVATE trellis_core)
+set_target_properties(trellis-devices PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
 add_executable(trellis-decode-replay src/decode_replay.cpp)
 target_link_libraries(trellis-decode-replay PRIVATE trellis_core)
@@ -323,6 +402,25 @@ add_executable(trellis-test-slat-shape src/test_slat_shape.cpp)
 target_link_libraries(trellis-test-slat-shape PRIVATE trellis_core)
 set_target_properties(trellis-test-slat-shape PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
+add_executable(trellis-test-uv-chart-density src/test_uv_chart_density.cpp)
+target_include_directories(trellis-test-uv-chart-density PRIVATE include)
+
+add_executable(trellis-test-quad-quality src/test_quad_quality.cpp)
+target_include_directories(trellis-test-quad-quality PRIVATE include)
+
+add_executable(trellis-test-uv-normal-margin src/test_uv_normal_margin.cpp src/tri_bvh.cpp)
+target_include_directories(trellis-test-uv-normal-margin PRIVATE include)
+
+add_executable(trellis-test-voxel-pbr src/test_voxel_pbr.cpp src/tri_bvh.cpp)
+target_include_directories(trellis-test-voxel-pbr PRIVATE include)
+
+add_executable(trellis-test-uv-preset src/test_uv_preset.cpp)
+target_link_libraries(trellis-test-uv-preset PRIVATE trellis_core)
+set_target_properties(trellis-test-uv-preset PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
+add_executable(trellis-test-uv-overlap-cover src/test_uv_overlap_cover.cpp)
+target_link_libraries(trellis-test-uv-overlap-cover PRIVATE trellis_core)
+
 add_executable(trellis-test-dinov3 src/test_dinov3.cpp)
 target_link_libraries(trellis-test-dinov3 PRIVATE trellis_core)
 set_target_properties(trellis-test-dinov3 PROPERTIES BUILD_RPATH "${GGML_RPATH}")
@@ -347,6 +445,10 @@ add_executable(trellis-test-shape-dec src/test_shape_dec.cpp)
 target_link_libraries(trellis-test-shape-dec PRIVATE trellis_core)
 set_target_properties(trellis-test-shape-dec PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
+add_executable(trellis-test-pixal3d src/test_pixal3d.cpp src/trellis_args.cpp)
+target_link_libraries(trellis-test-pixal3d PRIVATE trellis_core)
+set_target_properties(trellis-test-pixal3d PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
 add_executable(trellis-cli src/trellis_cli_main.cpp src/trellis_cli.cpp src/trellis_args.cpp)
 target_link_libraries(trellis-cli PRIVATE trellis_core)
 set_target_properties(trellis-cli PROPERTIES BUILD_RPATH "${GGML_RPATH}")
@@ -354,6 +456,12 @@ set_target_properties(trellis-cli PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 # Resident HTTP server (keeps the process warm; wraps trellis_run).
 find_package(Threads REQUIRED)
 add_executable(post-replay src/post_replay.cpp)
+if(TARGET trellis-retopo-atlas)
+  add_dependencies(trellis-retopo-atlas post-replay trellis-audit-quad-topology
+    trellis-chart-quads trellis-audit-quad-uv trellis-audit-uv
+    trellis-repack-uv trellis-bake-quads)
+  add_dependencies(trellis-cli trellis-retopo-atlas)
+endif()
 target_link_libraries(post-replay PRIVATE trellis_core Threads::Threads)
 set_target_properties(post-replay PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 

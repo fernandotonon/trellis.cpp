@@ -2,8 +2,11 @@
 //   trellis-cli <image.png> <out.glb> [gpu] [models_dir] [seed]
 // Models are loaded/freed per stage to keep VRAM modest.
 #include "trellis_model.h"
+#include "trellis_debug.h"
+#include "trellis_sched.h"
 #include "preprocess.h"
 #include "dinov3.h"
+#include "pixal3d.h"
 #include "flow_runner.h"
 #include "ss_decoder.h"
 #include "shape_decoder.h"
@@ -12,10 +15,13 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "mesh_shape.h"
 #include "stb_image_write.h"
 #include "trellis_run.h"
+#include "ggml.h"   // proj_in_channels is read straight off the checkpoint's proj_linear weight
 
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 #include <string>
@@ -23,9 +29,24 @@
 #include <set>
 #include <array>
 #include <cmath>
+#include <stdexcept>
+#include <cctype>
+#include <filesystem>
+#include <system_error>
+#ifdef __linux__
+#include <sys/wait.h>
+#include <spawn.h>
+#include <unistd.h>
+#endif
 
 using std::vector;
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static bool backend_is_htp(const std::string& backend) {
+    if (backend.size() != 3) return false;
+    return std::tolower((unsigned char)backend[0]) == 'h' &&
+           std::tolower((unsigned char)backend[1]) == 't' &&
+           std::tolower((unsigned char)backend[2]) == 'p';
+}
 // [dbg] overall stats of a flat tensor — used to compare LR vs HR shape-SLAT in decode space.
 static void slat_stats(const char* tag, const vector<float>& v) {
     if (v.empty()) { printf("      [stats] %s EMPTY\n", tag); return; }
@@ -46,6 +67,46 @@ static const float TEX_MEAN[32]={3.501659f,2.212398f,2.226094f,0.251093f,-0.0262
 static const float TEX_STD[32]={2.665652f,2.743913f,2.765121f,2.595319f,3.037293f,2.291316f,2.144656f,2.911822f,2.969419f,2.501689f,2.154811f,3.163343f,2.621215f,2.381943f,3.186697f,3.021588f,2.295916f,3.234985f,3.233086f,2.260140f,2.874801f,2.810596f,3.292720f,2.674999f,2.680878f,2.372054f,2.451546f,2.353556f,2.995195f,2.379849f,2.786195f,2.775190f};
 
 int trellis_run(const trellis::TrellisParams& cfg) {
+    namespace fs = std::filesystem;
+    fs::path retopo_driver, retopo_run;
+    if (cfg.retopo) {
+#ifndef __linux__
+        fprintf(stderr,"[trellis] native retopo launch is currently supported on Linux only\n");
+        return 1;
+#else
+        if (!cfg.texture || cfg.bg_only || std::getenv("TRELLIS_STOP_AFTER_POST_DUMP")) {
+            fprintf(stderr,"[trellis] retopo needs textured generation through the POST stage\n");
+            return 1;
+        }
+        if ((cfg.retopo_grid!=512 && cfg.retopo_grid!=1024 && cfg.retopo_grid!=1536) ||
+            cfg.retopo_first_faces<0 || cfg.retopo_final_faces<=0 ||
+            (cfg.retopo_atlas!=1024 && cfg.retopo_atlas!=2048 && cfg.retopo_atlas!=4096)) {
+            fprintf(stderr,"[trellis] invalid retopo settings\n");
+            return 1;
+        }
+        std::error_code ec;
+        retopo_driver=fs::canonical("/proc/self/exe",ec).parent_path()/"trellis-retopo-atlas";
+        if (ec || access(retopo_driver.c_str(),X_OK)!=0) {
+            fprintf(stderr,"[trellis] retopo driver unavailable: %s\n",retopo_driver.c_str());
+            return 1;
+        }
+        const fs::path root=fs::absolute(cfg.retopo_workdir);
+        fs::create_directories(root,ec);
+        if (ec) {
+            fprintf(stderr,"[trellis] cannot create retopo workdir: %s\n",ec.message().c_str());
+            return 1;
+        }
+        std::string pattern=(root/"run-XXXXXX").string();
+        std::vector<char> mutable_pattern(pattern.begin(),pattern.end());
+        mutable_pattern.push_back('\0');
+        const char* created=mkdtemp(mutable_pattern.data());
+        if (!created) {
+            fprintf(stderr,"[trellis] cannot create retopo run directory\n");
+            return 1;
+        }
+        retopo_run=created;
+#endif
+    }
     // Unbuffered, not line-buffered: MSVCRT treats _IOLBF as full buffering, which
     // swallows stage progress when piped (e.g. under Lemonade) if the process crashes.
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -62,13 +123,71 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     // Publish the cross-module flags this run wants (modules read them with an env fallback).
     const bool F32 = cfg.f32; trellis::g_sparse_cast_f32 = F32;  // f16 default (rope bug was the real issue)
     trellis::g_no_fa = cfg.no_fa;
+    // CLI flags win over environment switches and the HTP-specific fast default.
+    std::string requested_backend = cfg.backend;
+    if (requested_backend.empty()) {
+        if (const char* e = std::getenv("TRELLIS_BACKEND")) requested_backend = e;
+    }
+    const bool fa_f32_env = std::getenv("TRELLIS_FA_F32") != nullptr;
+    const bool fa_fast_env = std::getenv("TRELLIS_FA_FAST") != nullptr;
+    const bool fa_auto_htp = cfg.fa_fast < 0 && !fa_f32_env && !fa_fast_env &&
+                             backend_is_htp(requested_backend);
+    if (cfg.fa_fast >= 0) {
+        trellis::g_fa_fast = cfg.fa_fast;
+    } else if (fa_f32_env) {
+        trellis::g_fa_fast = 0;
+    } else if (fa_fast_env) {
+        trellis::g_fa_fast = 1;
+    } else {
+        // An empty requested backend is genuinely auto-selected later by Model::load;
+        // leave the policy unresolved so sdpa can inspect that model's actual backend.
+        trellis::g_fa_fast = requested_backend.empty() ? -1 : (fa_auto_htp ? 1 : 0);
+    }
     trellis::g_require_gpu = cfg.require_gpu;
     trellis::g_cpu_threads = cfg.threads;
+    trellis::g_backend = cfg.backend;
+    trellis::set_verbose(cfg.verbose);
+    trellis::set_sched_mode(cfg.sched);
+    trellis::set_vulkan_fallback_mode(cfg.vulkan_fallback);
+    if (!cfg.no_fa) {
+        if (trellis::g_fa_fast < 0) {
+            fprintf(stderr, "[trellis] FlashAttention precision: auto (F16 fast on HTP; BF16/F32 otherwise)\n");
+        } else {
+            fprintf(stderr, "[trellis] FlashAttention precision: %s%s\n",
+                    trellis::g_fa_fast ? "F16 fast" : "BF16 K/V + F32 accumulation",
+                    fa_auto_htp ? " (HTP default)" : "");
+        }
+    }
     const std::string& img = cfg.image;
     const std::string& outglb = cfg.output;
     const std::string& M = cfg.models;
     const int gpu = cfg.gpu;
     const bool cascade = cfg.cascade;   // 1024 cascade is the TRELLIS default; --res 512 forces the light path
+
+    // --model pixal3d. Everything below the conditioning — sampler schedules, guidance, the SS /
+    // shape / texture decoders, the remesh and the bake — is shared with TRELLIS.2; only how the
+    // image enters each DiT changes. See pixal3d.h.
+    const bool pix = cfg.family == trellis::ModelFamily::Pixal3D;
+    // Both families live in ONE model directory. The flows and NAF are family-specific and carry
+    // a `pixal3d_` prefix; the decoders, DINOv3 and BiRefNet are byte-identical between the two
+    // and keep their plain names, so adding Pixal3D to an existing TRELLIS.2 set is 5 new files
+    // rather than a second copy of everything.
+    const std::string FP = pix ? "/pixal3d_" : "/";
+    trellis::CameraParams cam;
+    if (pix) {
+        constexpr float PIXAL3D_DEFAULT_FOV = 0.8575560450553894f;   // radians (~49.13 deg)
+        const float fov = cfg.fov_deg > 0.0f ? cfg.fov_deg * 3.14159265358979f / 180.0f
+                                             : PIXAL3D_DEFAULT_FOV;
+        // The distance is derived at 512 on purpose: the projection is resolution-independent
+        // once normalized, so one camera serves both the 512 and the 1024 stages.
+        cam = trellis::pixal3d_camera(fov, cfg.mesh_scale, 512, cfg.extend_pixel);
+        printf("[trellis] model family: pixal3d (fov %.2f deg, distance %.4f, mesh scale %.2f, extend %d px)\n",
+               fov * 180.0f / 3.14159265358979f, cam.distance, cam.mesh_scale, cfg.extend_pixel);
+        if (cfg.fov_deg <= 0.0f)
+            printf("      (using Pixal3D's default FOV — MoGe-2 estimation is not ported; pass"
+                   " --fov if the object's perspective is noticeably wider or flatter)\n");
+    }
+
     std::mt19937 rng(run_seed); std::normal_distribution<float> randn(0.f, 1.f);
     auto noise = [&](size_t n){ vector<float> v(n); for (auto& x : v) x = randn(rng); return v; };
     double t0 = now();
@@ -95,7 +214,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         printf("[1/6] preprocess %s (BiRefNet bg removal, %s)\n", img.c_str(), cascade ? "1024 cascade" : "512");
         // Full BiRefNet (Swin-L backbone + deformable-conv decoder) runs on the GPU. Cutout computed
         // once, normalized for 512 and 1024.
-        trellis::Model bm = trellis::Model::load(M + "/birefnet.gguf", gpu);
+        // BiRefNet's small convolutions are slower and currently nondeterministic on HTP.
+        // Keep other explicitly selected backends on their existing path.
+        const std::string bg_saved_backend = trellis::g_backend;
+        const bool bg_on_cpu = backend_is_htp(requested_backend);
+        if (bg_on_cpu) trellis::g_backend = "CPU";
+        trellis::Model bm = trellis::Model::load(M + "/birefnet.gguf",
+                                                 bg_on_cpu ? -1 : gpu);
+        trellis::g_backend = bg_saved_backend;
         cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz);
         bm.free();
         if (cutout.empty()) return 1;
@@ -121,12 +247,28 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         if (cfg.bg_only) { printf("[bg-only] done (%.1fs)\n", now() - t0); return 0; }
     }
 
+    // Raw [0,1] guides for NAF. The DINOv3 branch wants the ImageNet-normalized tensor; NAF's
+    // image encoder wants the unnormalized one, so both are kept.
+    vector<float> guide, guide1024;
+    if (pix && cfg.naf) {
+        guide = trellis::cutout_to_chw01(cutout, cut_sz, 512);
+        if (cascade) guide1024 = trellis::cutout_to_chw01(cutout, cut_sz, 1024);
+    }
+
     printf("[2/6] DINOv3 conditioning\n");
-    vector<float> cond, cond1024;
+    vector<float> dino, dino1024;       // full token stream: 5 global + (S/16)^2 patches
     { trellis::Model m = trellis::Model::load(M + "/dinov3.gguf", gpu);
-      cond = trellis::dinov3_encode(m, chw, 512);
-      if (cascade) cond1024 = trellis::dinov3_encode(m, chw1024, 1024);
+      dino = trellis::dinov3_encode(m, chw, 512);
+      if (cascade) dino1024 = trellis::dinov3_encode(m, chw1024, 1024);
       m.free(); }
+    // TRELLIS.2 cross-attends over every token. Pixal3D cross-attends over the 5 global tokens
+    // (cls + registers) only and routes the patch grid through the projection branch instead, so
+    // the cross-attention context is just a prefix of the same tensor.
+    constexpr size_t N_GLOBAL_FLOAT = 5 * 1024;
+    vector<float> cond    = pix ? vector<float>(dino.begin(), dino.begin() + N_GLOBAL_FLOAT) : dino;
+    vector<float> cond1024;
+    if (cascade)
+        cond1024 = pix ? vector<float>(dino1024.begin(), dino1024.begin() + N_GLOBAL_FLOAT) : dino1024;
     const int Lc = (int)(cond.size() / 1024);
     vector<float> neg(cond.size(), 0.0f);
     const int Lc1024 = cascade ? (int)(cond1024.size() / 1024) : 0;
@@ -135,20 +277,66 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     slat_stats("cond_512 (DINOv3@512)", cond);
     if (cascade) slat_stats("cond_1024 (DINOv3@1024)", cond1024);
 
+    // Per-stage projection conditioning. `proj_ch` is read off the stage's own proj_linear rather
+    // than guessed from a config, which also doubles as the check that a --model pixal3d run is
+    // pointed at Pixal3D weights (and a --model trellis run is not).
+    auto proj_ch_of = [&](const trellis::Model& m) -> int {
+        ggml_tensor* w = m.try_get("blocks.0.cross_attn.proj_linear.weight");
+        if (pix && !w)
+            throw std::runtime_error("--model pixal3d but the checkpoint has no cross_attn.proj_linear "
+                                     "(these are TRELLIS.2 weights)");
+        if (!pix && w)
+            throw std::runtime_error("--model trellis but the checkpoint has cross_attn.proj_linear "
+                                     "(these are Pixal3D weights; pass --model pixal3d)");
+        return w ? (int)w->ne[0] : 0;
+    };
+    // grid_res: the stage's projection grid. S / naf_out: the DINOv3 image size the stage was
+    // trained on and its NAF target, both taken from the Pixal3D stage configs.
+    auto build_proj = [&](int grid_res, int S, int naf_out, int proj_ch,
+                          const vector<std::array<int,3>>* cds) {
+        const vector<float>& dn = (S == 1024) ? dino1024 : dino;
+        const vector<float>& gd = (S == 1024) ? guide1024 : guide;
+        const bool want_naf = (proj_ch == 2048) && cfg.naf;
+        trellis::ProjCond pc;
+        if (want_naf) {
+            trellis::Model nm = trellis::Model::load(M + FP + "naf.gguf", gpu);
+            pc = trellis::pixal3d_proj_cond(dn, S, grid_res, proj_ch, cam, cds, &nm, &gd, naf_out);
+            nm.free();
+        } else {
+            pc = trellis::pixal3d_proj_cond(dn, S, grid_res, proj_ch, cam, cds, nullptr, nullptr, naf_out);
+        }
+        printf("      proj cond: grid %d^3, image %d, %d ch%s\n", grid_res, S, proj_ch,
+               proj_ch == 2048 ? (want_naf ? ", NAF upsampled" : ", NAF DISABLED") : "");
+        return pc;
+    };
+
     printf("[3/6] sparse-structure flow + decode\n");
     vector<std::array<int,3>> coords;
     {
-        trellis::Model m = trellis::Model::load(M + "/ss_flow.gguf", gpu);
+        trellis::Model m = trellis::Model::load(M + FP + "ss_flow.gguf", gpu);
         trellis::DiTParams p; p.in_ch = 8; p.out_ch = 8; p.d_cond = 1024; p.cast_f32 = F32;
+        p.proj_ch = proj_ch_of(m); p.proj_mode = p.proj_ch > 0;
+        // The sparse-structure DiT is dense at 16^3, and Pixal3D's SS stage projects a 16^3 grid,
+        // so its proj tokens line up one-to-one with the DiT tokens in the same x-major order.
+        trellis::ProjCond pc;
+        if (pix) pc = build_proj(16, 512, 0, p.proj_ch, nullptr);
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
-        trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
-        trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
-        vector<float> z = trellis::sample_flow(fwd, noise(8*4096), cond.data(), neg.data(), sp);  // [8,4096] ne0=8
+        trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
+        trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
+        vector<float> z = trellis::sample_flow(fwd, noise(8*4096),
+                              trellis::FlowCond(cond.data(), pix ? pc.proj.data()     : nullptr),
+                              trellis::FlowCond(neg.data(),  nullptr), sp);  // [8,4096] ne0=8
         delete run; m.free();
         // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
         vector<float> zdec(8*4096);
         for (int c = 0; c < 8; ++c) for (int sp2 = 0; sp2 < 4096; ++sp2) zdec[(size_t)c*4096 + sp2] = z[c + 8*sp2];
-        trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", gpu);
+        // This small decoder currently miscomputes a CONT/view-to-ADD chain on HTP.
+        // Its CPU cost is negligible; other backends retain their existing placement.
+        const std::string saved_backend = trellis::g_backend;
+        const bool ss_dec_on_cpu = backend_is_htp(requested_backend);
+        if (ss_dec_on_cpu) trellis::g_backend = "CPU";
+        trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", ss_dec_on_cpu ? -1 : gpu);
+        trellis::g_backend = saved_backend;
         vector<float> logits = trellis::ss_decode(d, zdec); d.free();
         coords = trellis::ss_coords(logits, 64, 32);
     }
@@ -156,18 +344,34 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     printf("      active voxels @res32 = %d\n", (int)coords.size());
     if (coords.empty()) { fprintf(stderr, "no voxels produced\n"); return 1; }
 
-    const bool do_tex = cfg.texture;
+    bool do_tex = cfg.texture;
+    // Pixal3D publishes a single (1024) texture flow, where TRELLIS.2 publishes both. The light
+    // --res 512 path has no texture model to run at all, so it degrades to geometry only.
+    if (do_tex && pix && !cascade) {
+        FILE* tf = fopen((M + FP + "tex_flow_512.gguf").c_str(), "rb");
+        if (tf) fclose(tf);
+        else { printf("      (pixal3d ships no res-512 texture flow -- writing geometry only)\n"); do_tex = false; }
+    }
 
     // one shape SLAT flow run -> normalized [32,n] (sparse, CFG 7.5, gi[0.6,1], rescale_t 3)
+    // `grid_res` is the resolution the sparse coords are expressed in — the same grid Pixal3D
+    // projects for this stage — and S / naf_out are the stage's DINOv3 image size and NAF target.
+    // They are ignored in TRELLIS.2 mode.
     auto shape_flow = [&](const std::string& path, const vector<std::array<int,3>>& cds,
-                          const float* cnd, const float* ncnd, int lc) {
+                          const float* cnd, const float* ncnd, int lc,
+                          int grid_res, int S, int naf_out) {
         const int n = (int)cds.size();
         trellis::Model m = trellis::Model::load(path, gpu);
         trellis::DiTParams p; p.in_ch = 32; p.out_ch = 32; p.d_cond = 1024; p.cast_f32 = F32;
+        p.proj_ch = proj_ch_of(m); p.proj_mode = p.proj_ch > 0;
+        trellis::ProjCond pc;
+        if (pix) pc = build_proj(grid_res, S, naf_out, p.proj_ch, &cds);
         trellis::DitRunner* run = trellis::make_sparse_runner(m, p, cds, lc);
-        trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
-        trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
-        vector<float> sn = trellis::sample_flow(fwd, noise((size_t)32*n), cnd, ncnd, sp);   // [32,n]
+        trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
+        trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
+        vector<float> sn = trellis::sample_flow(fwd, noise((size_t)32*n),
+                               trellis::FlowCond(cnd,  pix ? pc.proj.data()     : nullptr),
+                               trellis::FlowCond(ncnd, nullptr), sp);   // [32,n]
         delete run; m.free();
         return sn;
     };
@@ -194,7 +398,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         const int max_tok   = cfg.max_tokens;
         printf("[4/7] shape SLAT flow (LR 512 -> upsample -> HR %d cascade, max_tok=%d)\n", hr_target, max_tok);
         // (1) LR shape flow @res32 with cond_512
-        lr_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc);
+        lr_norm = shape_flow(M + FP + "shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc,
+                             /*grid_res=*/32, /*S=*/512, /*naf_out=*/512);
         lr_dn.resize(lr_norm.size());
         for (size_t n = 0; n < coords.size(); ++n) for (int c = 0; c < 32; ++c)
             lr_dn[(size_t)c + 32*n] = lr_norm[(size_t)c + 32*n]*SHAPE_STD[c] + SHAPE_MEAN[c];
@@ -203,16 +408,33 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         vector<std::array<int,3>> hr_coords;
         { trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
           hr_coords = trellis::shape_upsample(m, lr_dn, coords); m.free(); }
-        // (3) quantize res512 -> res(hr_res//16) with the reference's adaptive token-budget backoff
-        //     (sample_shape_slat_cascade): start at hr_target, step -128 toward the 1024 floor while
-        //     the unique token count would exceed max_num_tokens. grid = hr_res//16 is integral since
-        //     128/16 = 8 (1536->96, 1408->88, ..., 1024->64).
+        // (3) quantize res512 -> res(hr_res//16) with the reference's adaptive token-budget backoff:
+        //     start at hr_target, step -128 toward the 1024 floor while the unique token count
+        //     would exceed max_num_tokens. grid = hr_res//16 is integral since 128/16 = 8
+        //     (1536->96, 1408->88, ..., 1024->64).
+        //
+        //     The two families quantize DIFFERENTLY, and it matters far more than it looks.
+        //     TRELLIS.2 floors `u * grid` — a cell quantizer, and the coords only feed RoPE, where
+        //     a half-cell offset is a smooth reparameterization. Pixal3D rounds `u * (grid - 1)`,
+        //     because for it the token index ALSO selects which projection-grid node the token
+        //     samples the image at, and that grid is the endpoint-inclusive linspace(-1, 1, grid):
+        //     rounding to the nearest node is what keeps the pixel-aligned sample registered.
+        //     (Pixal3D's own sample_shape_slat_cascade still carries the TRELLIS.2 form, but run()
+        //     never calls it — that dead helper is what this port originally followed.)
+        //
+        //     Using the wrong one is not a smooth warp but a step function: at grid 64 it moves
+        //     25% of coordinates a full cell along each axis, in stripes of period 8, so 58% of
+        //     tokens are misregistered on at least one axis. A cell is 16 res-1024 voxels — one
+        //     ViT-L/16 patch at S=1024. The silhouette survives on the global tokens; the fine
+        //     detail does not, and the decode comes out speckled.
         int hr_res = hr_target;
         for (;;) {
             const int gi = hr_res / 16;          // integral grid (ref's hr_resolution//16)
-            const float g = (float)gi;
+            const float g = pix ? (float)(gi - 1) : (float)gi;
+            auto qz = [&](float c) { return pix ? (int)lrintf((c + 0.5f) / 512.f * g)
+                                               : (int)((c + 0.5f) / 512.f * g); };
             std::set<std::array<int,3>> q;
-            for (auto& c : hr_coords) q.insert({ (int)((c[0]+0.5f)/512.f*g), (int)((c[1]+0.5f)/512.f*g), (int)((c[2]+0.5f)/512.f*g) });
+            for (auto& c : hr_coords) q.insert({ qz((float)c[0]), qz((float)c[1]), qz((float)c[2]) });
             if ((int)q.size() < max_tok || hr_res <= 1024) {
                 shc.assign(q.begin(), q.end());
                 printf("      upsampled coords @res512=%d -> quantized @res%d (grid %d) = %d tokens\n",
@@ -223,13 +445,25 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                    hr_res, gi, (int)q.size(), max_tok);
             hr_res -= 128;
         }
-        // (4) HR shape flow @res(hr_res//16) with cond_1024
-        slat_norm = shape_flow(M + "/shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024);
+        // (4) HR shape flow @res(hr_res//16) with cond_1024. The projection grid follows the same
+        //     backoff as the token grid — Pixal3D overrides its cond model's grid_resolution to
+        //     hr_res//16 for exactly this reason — while the NAF target stays at the stage's 512.
+        // The HR stage is the only one conditioned on DINOv3 at 1024. If its feature map were read
+        // with a different spatial layout than the 512 one — which the LR stage uses successfully —
+        // nothing else in the pipeline would show it: the features would still be well-scaled,
+        // well-correlated across the proj halves, and finite.
+        if (pix)
+            printf("      [stats] proj: DINOv3@1024 vs @512 agreement on the same points = %.3f\n",
+                   trellis::pixal3d_cross_res_agreement(dino1024, 1024, dino, 512,
+                                                        hr_res / 16, cam, shc));
+        slat_norm = shape_flow(M + FP + "shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024,
+                               /*grid_res=*/hr_res / 16, /*S=*/1024, /*naf_out=*/512);
         RES = hr_res; cond_dec = cond1024.data(); neg_dec = neg1024.data(); Lc_dec = Lc1024;
     } else {
         printf("[4/7] shape SLAT flow (512)\n");
         shc = coords;
-        slat_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc);
+        slat_norm = shape_flow(M + FP + "shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc,
+                               /*grid_res=*/32, /*S=*/512, /*naf_out=*/512);
     }
     const int N = (int)shc.size();
     slat_dn.resize(slat_norm.size());
@@ -254,6 +488,16 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         so = trellis::shape_decode(m, slat_dn, shc, RES); m.free();
         printf("      decoded voxels @res%d = %d\n", so.res, (int)so.coords.size());
         mesh = trellis::dual_grid_to_mesh(so);
+        // feats7 is consumed by dual_grid_to_mesh and is never referenced again.
+        // Release it before the enormous host-side topology passes; on the
+        // 31M-voxel torture case this returns ~830 MiB immediately.
+        const size_t shape_feat_bytes = so.feats7.capacity() * sizeof(float);
+        std::vector<float>().swap(so.feats7);
+        if (shape_feat_bytes >= (size_t)128 * 1024 * 1024) {
+            printf("      [host-mem] released shape feats7 %.2f GiB before mesh postprocess\n",
+                   shape_feat_bytes / (1024.0*1024.0*1024.0));
+            fflush(stdout);
+        }
     }
     printf("      mesh V=%d F=%d\n", mesh.V(), mesh.F());
     {   // reference postprocess fills small holes BEFORE the remesh (max_hole_perimeter=3e-2):
@@ -268,7 +512,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             printf("      [dump] pre-remesh mesh -> %s\n", dp); fflush(stdout); }
     }
 
-    vector<float> colors, pbr6;   // colors = base RGB (PLY); pbr6 = per-vertex [V*6] for UV bake
+    vector<float> colors, pbr6, dual_pbr6;   // colors = base RGB (PLY); pbr6 = per-vertex [V*6] for UV bake
+    const std::string retopo_dual_post=(retopo_run/"dual-high.post").string();
+    const char* dual_pbr_path=cfg.retopo_dual_pbr ? retopo_dual_post.c_str() : std::getenv("TRELLIS_DUMP_DUAL_PBR_POST");
     trellis::ShapeOut so_tex;                                    // res-512 tex-guide decode (mixed-res path)
     const vector<std::array<int,3>>* pbr_coords = &so.coords;    // coords/res the bake samples the PBR at
     int pbr_res = so.res;
@@ -282,33 +528,52 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         constexpr int DENSE_TEX = 9000000;
         const int tex_res = cfg.tex_res > 0 ? cfg.tex_res
                           : (cascade && (int)so.coords.size() > DENSE_TEX ? 512 : RES);
-        const bool mixed = cascade && tex_res != RES;   // res-1024 geometry + res-512 texture
+        // Pixal3D does not publish a res-512 texture flow; its texture stays at cascade resolution.
+        const bool mixed = cascade && tex_res != RES && !pix;
+        if (dual_pbr_path && (!*dual_pbr_path || !mixed || RES != 1024)) {
+            fprintf(stderr, "[trellis] dual PBR requires TRELLIS.2 with 1024 geometry and 512 primary PBR\n");
+            return 1;
+        }
         printf("[6/7] texture SLAT flow + PBR decode%s\n", mixed ? "  (res-512 texture on res-1024 mesh)" : "");
 
         if (mixed) {   // decode a res-512 shape (from the LR slat) to guide the res-512 tex decode
             trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
             so_tex = trellis::shape_decode(m, lr_dn, coords, 512); m.free();
             pbr_coords = &so_tex.coords; pbr_res = so_tex.res;
+            // The texture decoder needs only coords+subdivision masks from this
+            // guide; its 7-channel shape features are dead weight from here on.
+            std::vector<float>().swap(so_tex.feats7);
+            // Mixed mode now samples PBR from so_tex.coords, so the giant HR
+            // coordinate table can also be returned to the OS before tex flow.
+            if (!dual_pbr_path) std::vector<std::array<int,3>>().swap(so.coords);
             printf("      res-512 tex-guide decode: %d voxels\n", (int)so_tex.coords.size());
+            printf("      [host-mem] mixed texture: %s + tex-guide feats7\n",
+                   dual_pbr_path ? "retained HR shape coords for dual PBR" : "released HR shape coords");
+            fflush(stdout);
         }
-        // tex flow + decode inputs: HR path (shc/slat_norm/cond_dec/so.subs) vs res-512 mixed path
-        // (coords/lr_norm/cond_512/so_tex.subs). The tex decoder upsamples via the guide subdivision.
-        const std::string tflow = M + (mixed ? "/tex_flow_512.gguf" : (cascade ? "/tex_flow_1024.gguf" : "/tex_flow_512.gguf"));
-        const vector<std::array<int,3>>& tcoords = mixed ? coords : shc;
-        const vector<float>& tslat = mixed ? lr_norm : slat_norm;
-        const float* tcond = mixed ? cond.data() : cond_dec;
-        const float* tneg  = mixed ? neg.data()  : neg_dec;
-        const int    tlc   = mixed ? Lc : Lc_dec;
-        const int    tN    = (int)tcoords.size();
-        const std::vector<std::vector<uint8_t>>& tsubs = mixed ? so_tex.subs : so.subs;
+        auto decode_texture = [&](bool use_mixed) {
+            const std::string tflow = M + FP + (use_mixed ? "tex_flow_512.gguf" : (cascade ? "tex_flow_1024.gguf" : "tex_flow_512.gguf"));
+            const vector<std::array<int,3>>& tcoords = use_mixed ? coords : shc;
+            const vector<float>& tslat = use_mixed ? lr_norm : slat_norm;
+            const float* tcond = use_mixed ? cond.data() : cond_dec;
+            const float* tneg = use_mixed ? neg.data() : neg_dec;
+            const int tlc = use_mixed ? Lc : Lc_dec;
+            const int tN = (int)tcoords.size();
+            const auto& tsubs = use_mixed ? so_tex.subs : so.subs;
+            const int Mv = (int)(use_mixed ? so_tex.coords.size() : so.coords.size());
+            const bool tex_lr = use_mixed || !cascade;
+            const int tgrid = tex_lr ? 32 : RES / 16;
+            const int tS = tex_lr ? 512 : 1024;
+            const int tnaf = tex_lr ? 256 : 1024;
+            vector<float> texlat;
 
-        vector<float> texlat;
-        {
             trellis::Model m = trellis::Model::load(tflow, gpu);
             trellis::DiTParams p; p.in_ch = 64; p.out_ch = 32; p.d_cond = 1024; p.cast_f32 = F32;
+            p.proj_ch = proj_ch_of(m); p.proj_mode = p.proj_ch > 0;
+            trellis::ProjCond pc;
+            if (pix) pc = build_proj(tgrid, tS, tnaf, p.proj_ch, &tcoords);
             trellis::DitRunner* run = trellis::make_sparse_runner(m, p, tcoords, tlc);
-            // state is the 32-ch noise; each forward concat [noise(32) ; shape_slat_norm(32)] -> 64ch
-            trellis::FlowFwd fwd = [&](const vector<float>& st, float ts, const float* c) {
+            trellis::FlowFwd fwd = [&](const vector<float>& st, float ts, const trellis::FlowCond& c) {
                 vector<float> x64((size_t)64 * tN);
                 for (int n = 0; n < tN; ++n) {
                     for (int k = 0; k < 32; ++k) x64[(size_t)k + 64*n]      = st[(size_t)k + 32*n];
@@ -316,23 +581,38 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 }
                 return run->forward(x64, ts, c);
             };
-            trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
-            texlat = trellis::sample_flow(fwd, noise((size_t)32*tN), tcond, tneg, sp);  // [32,tN]
+            trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
+            texlat = trellis::sample_flow(fwd, noise((size_t)32*tN),
+                         trellis::FlowCond(tcond, pix ? pc.proj.data()     : nullptr),
+                         trellis::FlowCond(tneg,  nullptr), sp);  // [32,tN]
             delete run; m.free();
             for (int n = 0; n < tN; ++n) for (int c = 0; c < 32; ++c) texlat[(size_t)c + 32*n] = texlat[(size_t)c + 32*n]*TEX_STD[c] + TEX_MEAN[c];
-        }
-        {
-            trellis::Model m = trellis::Model::load(M + "/tex_dec.gguf", gpu);
-            vector<float> pbr = trellis::tex_decode(m, texlat, tcoords, tsubs); m.free();   // [6,Mv] pre-scale
-            const int Mv = (int)pbr_coords->size();
-            colors.resize((size_t)Mv * 3); pbr6.resize((size_t)Mv * 6);
+            trellis::Model decoder = trellis::Model::load(M + "/tex_dec.gguf", gpu);
+            vector<float> pbr = trellis::tex_decode(decoder, texlat, tcoords, tsubs); decoder.free();
+            vector<float> decoded((size_t)Mv * 6);
             auto cl = [](float v){ return v < 0 ? 0.f : (v > 1 ? 1.f : v); };
-            for (int i = 0; i < Mv; ++i) {
-                for (int k = 0; k < 6; ++k) pbr6[(size_t)i*6 + k] = cl(pbr[(size_t)k + 6*i] * 0.5f + 0.5f);
-                for (int k = 0; k < 3; ++k) colors[(size_t)i*3 + k] = pbr6[(size_t)i*6 + k];
-            }
-            printf("      PBR voxels=%d @res%d\n", Mv, pbr_res);
+            for (int i = 0; i < Mv; ++i)
+                for (int k = 0; k < 6; ++k)
+                    decoded[(size_t)i*6 + k] = cl(pbr[(size_t)k + 6*i] * 0.5f + 0.5f);
+            return decoded;
+        };
+        const auto texture_rng = rng;
+        pbr6 = decode_texture(mixed);
+        const int Mv = (int)pbr_coords->size();
+        colors.resize((size_t)Mv * 3);
+        for (int i = 0; i < Mv; ++i)
+            for (int k = 0; k < 3; ++k)
+                colors[(size_t)i*3 + k] = pbr6[(size_t)i*6 + k];
+        printf("      PBR voxels=%d @res%d\n", Mv, pbr_res);
+        if (dual_pbr_path) {
+            rng = texture_rng;
+            dual_pbr6 = decode_texture(false);
+            printf("      secondary PBR voxels=%zu @res%d\n", dual_pbr6.size()/6, so.res);
         }
+        // Texture decode has consumed the subdivision guides.  Release their
+        // backing storage before the raw 100M+ face mesh enters weld/hole/BVH.
+        std::vector<std::vector<uint8_t>>().swap(so.subs);
+        std::vector<std::vector<uint8_t>>().swap(so_tex.subs);
         // `colors` is per-VOXEL but consumed per-VERTEX (weld, vertex-color GLB, PLY),
         // relying on dual_grid_to_mesh's vertex==voxel correspondence. fill_holes adds
         // cap vertices beyond Mv -- pad them (neutral grey; the caps are sub-voxel and
@@ -408,18 +688,130 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // occlusion-aware bucket assignment + depth-tested raster keep its bleed low.
         const bool boxuv = !cfg.xatlas;
         const int T = cfg.tex >= 0 ? cfg.tex : (cascade ? 2048 : 1024);
-        if (const char* dp = std::getenv("TRELLIS_DUMP_POST")) {
-            FILE* dfp = fopen(dp, "wb");
-            if (dfp) {   // geometry mesh + the PBR volume the bake samples (may be res-512 in mixed mode)
-                int dV = mesh.V(), dFc = mesh.F(), Mv = (int)pbr_coords->size(), res = pbr_res;
-                fwrite(&dV,4,1,dfp); fwrite(&dFc,4,1,dfp); fwrite(&Mv,4,1,dfp); fwrite(&res,4,1,dfp);
-                fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp);
-                fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp);
-                for (auto& c : *pbr_coords) { int xyz[3] = {c[0],c[1],c[2]}; fwrite(xyz,4,3,dfp); }
-                fwrite(pbr6.data(),4,(size_t)Mv*6,dfp);
-                fclose(dfp);
-                printf("      [dump] post-stage inputs -> %s\n", dp);
+        auto dump_post = [&](const char* path) {
+            FILE* dfp = fopen(path,"wb");
+            if (!dfp) return false;
+            const int dV=mesh.V(), dFc=mesh.F(), Mv=(int)pbr_coords->size(), res=pbr_res;
+            bool ok=fwrite(&dV,4,1,dfp)==1 && fwrite(&dFc,4,1,dfp)==1 &&
+                    fwrite(&Mv,4,1,dfp)==1 && fwrite(&res,4,1,dfp)==1 &&
+                    fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp)==(size_t)dV*3 &&
+                    fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp)==(size_t)dFc*3;
+            for (const auto& c : *pbr_coords) {
+                int xyz[3]={c[0],c[1],c[2]};
+                ok=fwrite(xyz,4,3,dfp)==3 && ok;
             }
+            ok=fwrite(pbr6.data(),4,(size_t)Mv*6,dfp)==(size_t)Mv*6 && ok;
+            ok=fclose(dfp)==0 && ok;
+            return ok;
+        };
+        if (const char* dp=std::getenv("TRELLIS_DUMP_POST")) {
+            if (!dump_post(dp)) {
+                fprintf(stderr,"[trellis] failed writing POST dump %s\n",dp);
+                return 1;
+            }
+            printf("      [dump] post-stage inputs -> %s\n",dp);
+        }
+        fs::path retopo_post;
+        if (cfg.retopo) {
+#ifdef __linux__
+            retopo_post=retopo_run/"source.post";
+            if (!dump_post(retopo_post.c_str())) {
+                fprintf(stderr,"[trellis] failed writing retopo POST %s\n",retopo_post.c_str());
+                return 1;
+            }
+            printf("      [retopo] POST and intermediates -> %s\n",retopo_run.c_str());
+#endif
+        }
+        if (dual_pbr_path) {
+            FILE* dfp = fopen(dual_pbr_path, "wb");
+            if (!dfp) {
+                fprintf(stderr, "[trellis] cannot open dual PBR dump %s\n", dual_pbr_path);
+                return 1;
+            }
+            int dV = mesh.V(), dFc = mesh.F(), Mv = (int)so.coords.size(), res = so.res;
+            bool ok = fwrite(&dV,4,1,dfp)==1 && fwrite(&dFc,4,1,dfp)==1 &&
+                      fwrite(&Mv,4,1,dfp)==1 && fwrite(&res,4,1,dfp)==1 &&
+                      fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp)==(size_t)dV*3 &&
+                      fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp)==(size_t)dFc*3;
+            for (const auto& c : so.coords) {
+                int xyz[3] = {c[0],c[1],c[2]};
+                ok = fwrite(xyz,4,3,dfp)==3 && ok;
+            }
+            ok = fwrite(dual_pbr6.data(),4,dual_pbr6.size(),dfp)==dual_pbr6.size() && ok;
+            ok = fclose(dfp)==0 && ok;
+            if (!ok) {
+                fprintf(stderr, "[trellis] failed writing dual PBR dump %s\n", dual_pbr_path);
+                return 1;
+            }
+            printf("      [dump] secondary PBR on the same geometry -> %s\n", dual_pbr_path);
+        }
+        if (std::getenv("TRELLIS_STOP_AFTER_POST_DUMP")) return 0;
+        if (cfg.retopo) {
+#ifdef __linux__
+            const fs::path quad_glb=retopo_run/"model.glb";
+            std::vector<std::string> args={retopo_driver.string(),"--from-post",retopo_post.string(),
+                quad_glb.string(),std::to_string(cfg.retopo_grid),
+                std::to_string(cfg.retopo_first_faces),std::to_string(cfg.retopo_final_faces),
+                std::to_string(cfg.retopo_atlas)};
+            if (cfg.retopo_no_weld_fill) args.emplace_back("--no-weld-fill");
+            std::vector<char*> raw;
+            for (auto& arg:args) raw.push_back(arg.data());
+            raw.push_back(nullptr);
+            extern char **environ;
+            std::vector<std::string> child_env;
+            for (char** entry=environ;*entry;++entry) {
+                const std::string value(*entry);
+                if (value.rfind("TMPDIR=",0)!=0 &&
+                    value.rfind("TRELLIS_RETOPO_SEED=",0)!=0 &&
+                    value.rfind("TRELLIS_RETOPO_COPYRIGHT=",0)!=0 &&
+                    value.rfind("TRELLIS_RETOPO_PBR_POST=",0)!=0)
+                    child_env.push_back(value);
+            }
+            child_env.push_back("TMPDIR="+retopo_run.string());
+            child_env.push_back("TRELLIS_RETOPO_SEED="+std::to_string(run_seed));
+            child_env.push_back("TRELLIS_RETOPO_COPYRIGHT="+cfg.copyright);
+            if (cfg.retopo_dual_pbr) child_env.push_back("TRELLIS_RETOPO_PBR_POST="+retopo_dual_post);
+            std::vector<char*> env_raw;
+            for (auto& value:child_env) env_raw.push_back(value.data());
+            env_raw.push_back(nullptr);
+            pid_t child=0;
+            const int launch=posix_spawn(&child,retopo_driver.c_str(),nullptr,nullptr,
+                                         raw.data(),env_raw.data());
+            if (launch!=0) {
+                fprintf(stderr,"[trellis] cannot launch retopo driver: %d\n",launch);
+                return 1;
+            }
+            int status=0;
+            if (waitpid(child,&status,0)<0 || !WIFEXITED(status) || WEXITSTATUS(status)!=0 ||
+                !fs::is_regular_file(quad_glb) ||
+                !fs::is_regular_file(retopo_run/"model.retopo-accepted.json")) {
+                fprintf(stderr,"[trellis] retopo failed; diagnostics in %s\n",retopo_run.c_str());
+                return 1;
+            }
+            std::error_code ec;
+            fs::path destination=fs::absolute(outglb);
+            fs::create_directories(destination.parent_path(),ec);
+            if (ec) {
+                fprintf(stderr,"[trellis] cannot create output directory: %s\n",ec.message().c_str());
+                return 1;
+            }
+            const fs::path staged=destination.string()+".retopo-staged-"+std::to_string(getpid());
+            fs::copy_file(quad_glb,staged,fs::copy_options::overwrite_existing,ec);
+            if (ec) {
+                fprintf(stderr,"[trellis] cannot stage retopo GLB: %s\n",ec.message().c_str());
+                fs::remove(staged);
+                return 1;
+            }
+            fs::rename(staged,destination,ec);
+            if (ec) {
+                fprintf(stderr,"[trellis] cannot publish retopo GLB: %s\n",ec.message().c_str());
+                fs::remove(staged);
+                return 1;
+            }
+            printf("done in %.1fs -> %s (quad audit: %s)\n",now()-t0,
+                   outglb.c_str(),(retopo_run/"model.retopo-accepted.json").c_str());
+            return 0;
+#endif
         }
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors,
                                1.0f / ((float)so.res * 8.0f));
@@ -447,9 +839,11 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
-            printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
-            fflush(stdout);
+            if (!std::getenv("TRELLIS_RETOPO_KEEP_COMPONENTS")) {
+                int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+                printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
+                fflush(stdout);
+            }
         }
         const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
@@ -461,13 +855,46 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         } else {
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
                                   cascade ? 300000 : 150000, dv, df);
-            trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
-            trellis::fill_small_holes(df);
+            if (!std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
+                !std::getenv("TRELLIS_QEM_COLLISION_GUARD")) {
+                trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
+                trellis::fill_small_holes(df);
+            }
             // Second component pass on the decimated mesh: a hallucinated ground plane
             // survives the dense-mesh drop (it decimates to a large flat slab) but is a
             // small fraction here and disconnected from the body. Ref is a single component.
-            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
-            if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
+            if (!std::getenv("TRELLIS_RETOPO_KEEP_COMPONENTS")) {
+                int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
+                if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
+            }
+        }
+        if (std::getenv("TRELLIS_RETOPO_SHAPE_REPAIR")) {
+            float minimum_angle = 1.0f;
+            if (const char* setting = std::getenv("TRELLIS_RETOPO_SHAPE_MIN_ANGLE")) {
+                char* end = nullptr;
+                minimum_angle = std::strtof(setting, &end);
+                if (end == setting || *end || !std::isfinite(minimum_angle) ||
+                    minimum_angle <= 0.0f || minimum_angle > 30.0f) {
+                    fprintf(stderr,"[trellis] invalid TRELLIS_RETOPO_SHAPE_MIN_ANGLE\n");
+                    return 1;
+                }
+            }
+            float maximum_move = 0.001f;
+            if (const char* setting = std::getenv("TRELLIS_RETOPO_SHAPE_MAX_MOVE")) {
+                char* end = nullptr;
+                maximum_move = std::strtof(setting, &end);
+                if (end == setting || *end || !std::isfinite(maximum_move) ||
+                    maximum_move <= 0.0f || maximum_move > 0.01f) {
+                    fprintf(stderr,"[trellis] invalid TRELLIS_RETOPO_SHAPE_MAX_MOVE\n");
+                    return 1;
+                }
+            }
+            auto flipped = trellis::flip_skinny_triangles(dv,df,minimum_angle);
+            auto smoothed = trellis::smooth_skinny_triangles(dv,df,minimum_angle,maximum_move);
+            printf("  shape repair: flips=%d moved=%d collision_rejections=%d max_displacement=%.9g\n",
+                   flipped.flips,smoothed.moved,
+                   flipped.collision_rejections+smoothed.collision_rejections,
+                   smoothed.maximum_displacement);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
         // Texels are shaded straight from the per-voxel PBR volume (trilinear sampling, the
@@ -489,6 +916,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             textured = true;
             printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
         } else printf("      uv_bake failed; falling back to vertex colors\n");
+    }
+    if (cfg.retopo && !textured) {
+        fprintf(stderr,"[trellis] textured POST unavailable for retopo\n");
+        return 1;
     }
     if (!textured)
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),

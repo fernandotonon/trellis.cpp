@@ -66,6 +66,29 @@ std::mutex g_mu;
 
 #define VKCHK(x) do { if ((x) != VK_SUCCESS) return false; } while (0)
 
+// A translation layer such as Mesa Dozen (Vulkan-on-D3D12) enumerates the *same*
+// physical GPU as the native driver, reporting the same device type and the same
+// device-local heap size. A type+heap heuristic therefore cannot separate them, and on
+// a tie the later-enumerated one wins -- which on Snapdragon sent BiRefNet's deformable
+// conv through D3D12 emulation instead of the native Adreno driver. ggml's own device
+// selection deprioritizes these by driver ID; mirror that here.
+bool is_translation_layer(VkPhysicalDevice pd, const VkPhysicalDeviceProperties& props) {
+    if (props.apiVersion < VK_API_VERSION_1_2) return false;   // driverID needs 1.2
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &drv;
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+    switch (drv.driverID) {
+#ifdef VK_DRIVER_ID_MESA_DOZEN
+        case VK_DRIVER_ID_MESA_DOZEN:  return true;   // Vulkan on D3D12
+#endif
+#ifdef VK_DRIVER_ID_MOLTENVK
+        case VK_DRIVER_ID_MOLTENVK:    return true;   // Vulkan on Metal
+#endif
+        default:                       return false;
+    }
+}
+
 bool pick_device() {
     uint32_t n = 0;
     if (vkEnumeratePhysicalDevices(g.instance, &n, nullptr) != VK_SUCCESS || n == 0) return false;
@@ -82,9 +105,12 @@ bool pick_device() {
         // as a huge device-local heap and would win a size-only heuristic while being
         // CPU-slow. Rank real GPUs first; tie-break by device-local heap size.
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
-        int rank = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 3
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 1 : 0;
+        // Any native GPU outranks a translation layer, but the layer still ranks above
+        // nothing so it remains usable when it is the only device present.
+        int rank = is_translation_layer(pd, props)                              ? 0
+                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 4
+                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU   ? 3
+                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU      ? 2 : 1;
 
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);

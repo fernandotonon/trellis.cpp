@@ -1,4 +1,5 @@
 #include "uv_bake.h"
+#include "voxel_pbr_sampler.h"
 #include "xatlas.h"
 #include "meshoptimizer.h"
 #include "Simplify.h"
@@ -20,79 +21,12 @@
 #include <queue>
 #include <unordered_map>
 #include <array>
+#include <stdexcept>
 
 namespace trellis {
 
 namespace {
-// Trilinear sampler over the sparse voxel PBR field. Missing corner voxels
-// drop out of the weighted sum (renormalized); a texel with no populated
-// corner stays unwritten and is filled by seam dilation, matching the
-// reference's inpaint step.
-struct VoxSampler {
-    std::unordered_map<uint64_t, int> map;
-    const std::vector<float>* feats;
-    int res;
-    const TriBvh* snap;
-    static uint64_t key(int x, int y, int z) {
-        return ((uint64_t)(uint32_t)x << 40) | ((uint64_t)(uint32_t)y << 20) | (uint32_t)z;
-    }
-    explicit VoxSampler(const VoxelPbr& v) : feats(v.feats), res(v.res), snap(v.snap) {
-        map.reserve(v.coords->size() * 2);
-        for (size_t i = 0; i < v.coords->size(); ++i) {
-            const auto& c = (*v.coords)[i];
-            map[key(c[0], c[1], c[2])] = (int)i;
-        }
-    }
-    bool trilinear(const float p[3], float out[6]) const {
-        float w[3]; int b[3];
-        for (int a = 0; a < 3; ++a) {
-            const float gf = (p[a] + 0.5f) * res - 0.5f;
-            b[a] = (int)std::floor(gf);
-            w[a] = gf - b[a];
-        }
-        float acc[6] = {0,0,0,0,0,0}, wsum = 0.f;
-        for (int dz = 0; dz < 2; ++dz) for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
-            const float ww = (dx ? w[0] : 1-w[0]) * (dy ? w[1] : 1-w[1]) * (dz ? w[2] : 1-w[2]);
-            if (ww <= 0.f) continue;
-            auto it = map.find(key(b[0]+dx, b[1]+dy, b[2]+dz));
-            if (it == map.end()) continue;
-            const float* f = &(*feats)[(size_t)it->second * 6];
-            for (int k = 0; k < 6; ++k) acc[k] += ww * f[k];
-            wsum += ww;
-        }
-        if (wsum <= 1e-6f) return false;
-        for (int k = 0; k < 6; ++k) out[k] = acc[k] / wsum;
-        return true;
-    }
-    bool sample(const float p[3], float out[6]) const {
-        if (trilinear(p, out)) return true;
-        // Decimation moves the surface off the voxel shell. Primary correction
-        // (reference behavior): snap to the closest point on the original mesh
-        // and resample there. Shell crawl remains as the no-BVH fallback.
-        if (snap) {
-            const TriBvh::Hit h = snap->closest(p, 8.0f / res);
-            if (h.face >= 0 && trilinear(h.point, out)) return true;
-        }
-        int b[3];
-        for (int a = 0; a < 3; ++a) b[a] = (int)std::floor((p[a] + 0.5f) * res - 0.5f);
-        for (int r = 1; r <= 3; ++r) {
-            float racc[6] = {0,0,0,0,0,0}; int hits = 0;
-            for (int dz = -r; dz <= r; ++dz) for (int dy = -r; dy <= r; ++dy) for (int dx = -r; dx <= r; ++dx) {
-                if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) continue;
-                auto it = map.find(key(b[0]+dx, b[1]+dy, b[2]+dz));
-                if (it == map.end()) continue;
-                const float* f = &(*feats)[(size_t)it->second * 6];
-                for (int k = 0; k < 6; ++k) racc[k] += f[k];
-                ++hits;
-            }
-            if (hits) {
-                for (int k = 0; k < 6; ++k) out[k] = racc[k] / hits;
-                return true;
-            }
-        }
-        return false;
-    }
-};
+using detail::VoxSampler;
 
 // Multi-source BFS dilation: every unwritten texel takes the color of its
 // nearest written one. Bounded passes leave unshaded islands wherever a region
@@ -507,7 +441,7 @@ int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max
     if (F == 0) return 0;
     // count undirected edge uses; remember one directed representative
     std::unordered_map<uint64_t, std::pair<int,uint64_t>> euse;   // key -> {count, directed (u<<32|v)}
-    euse.reserve(F * 3);
+    euse.reserve(F * 2);
     auto ekey = [](int a, int b) -> uint64_t { if (a > b) { int t = a; a = b; b = t; } return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
     for (size_t f = 0; f < F; ++f) {
         const int32_t* t = &faces[3*f];
@@ -611,29 +545,62 @@ void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
 }
 
 int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
-    const size_t F = faces.size() / 3;
-    auto ekey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
-    std::unordered_map<uint64_t, int> dir;
-    dir.reserve(F * 3 * 2);
-    for (size_t f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j)
-            dir[ekey(faces[3*f+j], faces[3*f+(j+1)%3])]++;
-    // Boundary edges traversed opposite to face winding so fan fills keep
-    // orientation consistent with their neighbors. Chains pass only through
-    // unambiguous boundary vertices (out- and in-degree exactly 1): at
-    // non-manifold junctions a single-successor map silently cross-links
-    // fragments of different holes into bogus mesh-spanning "loops".
-    std::unordered_map<int, int> nxt, outd, ind;
-    for (const auto& [k, cnt] : dir) {
-        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
-        if (cnt == 1 && dir.find(ekey(b, a)) == dir.end()) {
-            nxt[b] = a; outd[b]++; ind[a]++;
+    // Memory-scaled equivalent of the old two-hash-table implementation.
+    // On dense 1024 meshes F can exceed 100M; keeping directed and undirected
+    // edge maps alive together can require tens of GiB.  Both passes only need
+    // the boundary edge set, so collect it with ONE undirected use-count map,
+    // release that map, run the directed loop pass, then recollect after any
+    // new fan faces before the winding-agnostic pass.  Boundary semantics are
+    // unchanged: an edge is a boundary iff its undirected use count is exactly 1.
+    auto dkey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
+    auto ukey = [](int a, int b){
+        if (a > b) std::swap(a, b);
+        return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+    };
+
+    auto collect_boundary = [&](const char* pass) {
+        const size_t F = faces.size() / 3;
+        struct Use { int count = 0; uint64_t directed = 0; };
+        std::unordered_map<uint64_t, Use> euse;
+        // This is the same asymptotic map as fill_holes(), which already runs
+        // successfully on the decoded mesh before texture generation.  Do not
+        // over-reserve 6*F buckets like the previous fill_small_holes path.
+        euse.reserve(F * 3);
+        for (size_t f = 0; f < F; ++f) {
+            for (int j = 0; j < 3; ++j) {
+                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                auto& e = euse[ukey(a, b)];
+                ++e.count;
+                if (e.count == 1) e.directed = dkey(a, b);
+            }
         }
+        std::vector<uint64_t> boundary;
+        // Boundary edges are normally tiny compared with all triangle edges;
+        // avoid a giant speculative reserve and let this vector grow naturally.
+        for (const auto& kv : euse)
+            if (kv.second.count == 1) boundary.push_back(kv.second.directed);
+        if (F >= 1000000) {
+            printf("  [fill-holes-stream] %s F=%zu boundary=%zu (single edge map)\n",
+                   pass, F, boundary.size());
+            fflush(stdout);
+        }
+        // Force release before allocating the small successor/adjacency maps.
+        decltype(euse)().swap(euse);
+        return boundary;
+    };
+
+    // Pass 1: directed boundary walk, same winding-preserving behavior as before.
+    std::vector<uint64_t> boundary = collect_boundary("directed");
+    std::unordered_map<int, int> nxt, outd, ind;
+    for (uint64_t k : boundary) {
+        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
+        nxt[b] = a; outd[b]++; ind[a]++;
     }
     std::unordered_map<int, bool> used;
     int filled = 0;
     size_t added = 0;
     for (const auto& [start, first] : nxt) {
+        (void)first;
         if (used[start] || outd[start] != 1 || ind[start] != 1) continue;
         std::vector<int> loop = {start};
         int cur = start;
@@ -654,47 +621,49 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
         }
         ++filled;
     }
-    // Second pass, winding-agnostic (the GLB material is double-sided): loops
-    // whose boundary direction flips (simplification tears) never chain in the
-    // directed walk above. Assemble them over undirected boundary adjacency,
-    // restricted to unambiguous degree-2 vertices.
-    {
-        const size_t F2 = faces.size() / 3;
-        std::unordered_map<uint64_t, int> und;
-        und.reserve(F2 * 3 * 2);
-        for (size_t f = 0; f < F2; ++f)
-            for (int j = 0; j < 3; ++j) {
-                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
-                und[ekey(std::min(a,b), std::max(a,b))]++;
-            }
-        std::unordered_map<int, std::vector<int>> adj;
-        for (const auto& [k, cnt] : und) {
-            if (cnt != 1) continue;
-            const int a = (int)(k >> 32), b = (int)(uint32_t)k;
-            adj[a].push_back(b); adj[b].push_back(a);
+
+    // Release all pass-1 hash tables before the second full edge scan.
+    decltype(nxt)().swap(nxt);
+    decltype(outd)().swap(outd);
+    decltype(ind)().swap(ind);
+    decltype(used)().swap(used);
+
+    // Pass 2: if pass 1 changed topology, recompute the boundary AFTER its new
+    // fan faces.  If it filled nothing, the boundary set is unchanged and we
+    // can reuse it, avoiding a second 100M+-face scan entirely.
+    if (filled > 0) {
+        std::vector<uint64_t>().swap(boundary);
+        boundary = collect_boundary("undirected");
+    } else if (faces.size() / 3 >= 1000000) {
+        printf("  [fill-holes-stream] undirected: reusing boundary (directed pass filled 0)\n");
+        fflush(stdout);
+    }
+    std::unordered_map<int, std::vector<int>> adj;
+    for (uint64_t k : boundary) {
+        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
+        adj[a].push_back(b); adj[b].push_back(a);
+    }
+    std::unordered_map<int, bool> used2;
+    for (const auto& [start, nbrs] : adj) {
+        if (used2[start] || nbrs.size() != 2) continue;
+        std::vector<int> loop = {start};
+        int prev = start, cur = nbrs[0];
+        bool cycle = false, clean = true;
+        for (int steps = 0; steps <= max_loop; ++steps) {
+            auto it = adj.find(cur);
+            if (it == adj.end() || it->second.size() != 2 || used2[cur]) { clean = false; break; }
+            if (cur == start) { cycle = true; break; }
+            loop.push_back(cur);
+            const int nx = it->second[0] == prev ? it->second[1] : it->second[0];
+            prev = cur; cur = nx;
         }
-        std::unordered_map<int, bool> used2;
-        for (const auto& [start, nbrs] : adj) {
-            if (used2[start] || nbrs.size() != 2) continue;
-            std::vector<int> loop = {start};
-            int prev = start, cur = nbrs[0];
-            bool cycle = false, clean = true;
-            for (int steps = 0; steps <= max_loop; ++steps) {
-                auto it = adj.find(cur);
-                if (it == adj.end() || it->second.size() != 2 || used2[cur]) { clean = false; break; }
-                if (cur == start) { cycle = true; break; }
-                loop.push_back(cur);
-                const int nx = it->second[0] == prev ? it->second[1] : it->second[0];
-                prev = cur; cur = nx;
-            }
-            for (int v : loop) used2[v] = true;
-            if (!clean || !cycle || loop.size() < 3 || (int)loop.size() > max_loop) continue;
-            for (size_t i = 1; i + 1 < loop.size(); ++i) {
-                faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i+1]);
-                added += 1;
-            }
-            ++filled;
+        for (int v : loop) used2[v] = true;
+        if (!clean || !cycle || loop.size() < 3 || (int)loop.size() > max_loop) continue;
+        for (size_t i = 1; i + 1 < loop.size(); ++i) {
+            faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i+1]);
+            added += 1;
         }
+        ++filled;
     }
     if (filled) { printf("  fill_holes: %d boundary loops filled (+%zu faces)\n", filled, added); fflush(stdout); }
     return filled;
@@ -1643,6 +1612,75 @@ BakedMesh uv_box_project(const std::vector<float>& verts, int V, const std::vect
     printf("  uv_box_project: atlas %dx%d, Vo=%d Fo=%d (6 planes, %d re-bucketed, %d occluded-layer)\n",
            T, T, Vo, Fo, reassigned, layered);
     return out;
+}
+
+PresetUvBakeStats bake_preset_uv(BakedMesh& mesh, const VoxelPbr& vox) {
+    if (!vox.ok() || !vox.feats || vox.feats->size() != vox.coords->size()*6 ||
+        mesh.T < 128 || mesh.T > 4096 || mesh.verts.empty() || mesh.verts.size()%3 ||
+        mesh.uv.size()*3 != mesh.verts.size()*2 || mesh.faces.empty() || mesh.faces.size()%3)
+        throw std::invalid_argument("Invalid preset UV bake input");
+    for (float x : mesh.verts) if (!std::isfinite(x)) throw std::invalid_argument("Nonfinite preset position");
+    for (float x : mesh.uv) if (!std::isfinite(x) || x < 0 || x > 1) throw std::invalid_argument("Invalid preset UV");
+    for (int32_t x : mesh.faces) if (x < 0 || size_t(x) >= mesh.verts.size()/3)
+        throw std::invalid_argument("Invalid preset face index");
+    const int T = mesh.T;
+    mesh.base.assign(size_t(T)*T*4, 0);
+    mesh.mr.assign(size_t(T)*T*4, 0);
+    std::vector<uint8_t> inside(size_t(T)*T, 0), written(size_t(T)*T, 0);
+    VoxSampler sampler(vox);
+    PresetUvBakeStats stats;
+    auto u8 = [](float x) { x=std::clamp(x*255.f,0.f,255.f); return uint8_t(x); };
+    for (size_t f=0; f<mesh.faces.size()/3; ++f) {
+        const int32_t* id=&mesh.faces[3*f];
+        float px[3],py[3];
+        for (int j=0; j<3; ++j) {
+            px[j]=mesh.uv[2*id[j]]*T;
+            py[j]=mesh.uv[2*id[j]+1]*T;
+        }
+        const float d=(py[1]-py[2])*(px[0]-px[2])+(px[2]-px[1])*(py[0]-py[2]);
+        if (std::abs(d)<1e-12f) throw std::invalid_argument("Degenerate preset UV triangle");
+        const int x0=std::max(0,int(std::floor(std::min({px[0],px[1],px[2]}))));
+        const int y0=std::max(0,int(std::floor(std::min({py[0],py[1],py[2]}))));
+        const int x1=std::min(T-1,int(std::ceil(std::max({px[0],px[1],px[2]}))));
+        const int y1=std::min(T-1,int(std::ceil(std::max({py[0],py[1],py[2]}))));
+        for (int y=y0; y<=y1; ++y) for (int x=x0; x<=x1; ++x) {
+            const float fx=x+.5f,fy=y+.5f;
+            const float w0=((py[1]-py[2])*(fx-px[2])+(px[2]-px[1])*(fy-py[2]))/d;
+            const float w1=((py[2]-py[0])*(fx-px[2])+(px[0]-px[2])*(fy-py[2]))/d;
+            const float w2=1-w0-w1;
+            if (w0<-.001f || w1<-.001f || w2<-.001f) continue;
+            const size_t t=size_t(y)*T+x;
+            inside[t]=1;
+            float p[3]{};
+            for (int k=0; k<3; ++k)
+                p[k]=w0*mesh.verts[3*id[0]+k]+w1*mesh.verts[3*id[1]+k]+w2*mesh.verts[3*id[2]+k];
+            const float* sample_point=p;
+            TriBvh::Hit source_hit;
+            if (vox.snap) {
+                source_hit=vox.snap->closest(p);
+                if (source_hit.face<0) continue;
+                ++stats.projected_samples;
+                const double distance=std::sqrt(double(source_hit.dist2));
+                stats.maximum_source_distance=std::max(stats.maximum_source_distance,distance);
+                stats.projected_samples_above_0_008+=distance>0.008;
+                sample_point=source_hit.point;
+            }
+            float sample[6];
+            if (!sampler.sample(sample_point,sample)) continue;
+            mesh.base[4*t]=u8(sample[0]);mesh.base[4*t+1]=u8(sample[1]);
+            mesh.base[4*t+2]=u8(sample[2]);mesh.base[4*t+3]=u8(sample[5]);
+            mesh.mr[4*t]=0;mesh.mr[4*t+1]=u8(sample[4]);
+            mesh.mr[4*t+2]=u8(sample[3]);mesh.mr[4*t+3]=255;
+            written[t]=1;
+        }
+    }
+    for (size_t t=0; t<inside.size(); ++t) {
+        stats.covered_texels+=written[t]!=0;
+        stats.missing_voxel_texels+=inside[t] && !written[t];
+    }
+    if (!stats.covered_texels) throw std::runtime_error("No preset UV texels sampled from PBR volume");
+    dilate_full(mesh.base,mesh.mr,written,T);
+    return stats;
 }
 
 } // namespace trellis

@@ -1,5 +1,7 @@
 #include "sparse.h"
 #include "trellis_model.h"
+#include "trellis_debug.h"
+#include "trellis_sched.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -139,17 +141,17 @@ ggml_tensor* sparse_convnext(ggml_context* c, const Model& m, const std::string&
 
 // Run a graph with given inputs (name->host data), return one named output to host.
 namespace {
-// c2s builds conv1 + conv2 into ONE graph, and each conv is 27 taps x mul_mat_rows' 1M-row
-// chunks -- at res-1024 the post-subdiv conv2 alone is ~16 chunks. Node/tensor meta is host
-// RAM for structs only (~370 B each), so budget generously rather than risk GGML_ASSERT.
+// C2S streaming uses many short-lived GraphRun instances. Keep the metadata ceiling generous:
+// node/tensor metadata is host RAM only (~370 B each), while GPU workspace is owned and freed
+// independently by each GraphRun's gallocr.
 static constexpr size_t kGraphNodes = 65536;
 struct GraphRun {
-    const Model& m; ggml_context* c; ggml_gallocr_t alloc = nullptr;
-    GraphRun(const Model& mm) : m(mm) {
+    const Model& m; ggml_context* c; trellis::GraphExec ex;
+    GraphRun(const Model& mm) : m(mm), ex(mm) {
         size_t meta = ggml_tensor_overhead() * kGraphNodes + ggml_graph_overhead_custom(kGraphNodes, false) + (1 << 20);
         c = ggml_init({ meta, nullptr, true });
     }
-    ~GraphRun() { if (alloc) ggml_gallocr_free(alloc); ggml_free(c); }
+    ~GraphRun() { ggml_free(c); }
     // `roots` are extra nodes to expand: writes into a preallocated `out` via ggml_cpy are
     // not reachable from `out` itself (nothing produces it), so they must be rooted explicitly.
     std::vector<float> run(ggml_tensor* out, const std::vector<std::pair<ggml_tensor*, const void*>>& inputs,
@@ -158,17 +160,135 @@ struct GraphRun {
         ggml_cgraph* g = ggml_new_graph_custom(c, kGraphNodes, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(g, r);
         ggml_build_forward_expand(g, out);
-        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-        if (!ggml_gallocr_alloc_graph(alloc, g)) throw std::runtime_error("c2s: alloc failed");
+        if (!ex.alloc(g)) throw std::runtime_error("c2s: alloc failed");
         if (getenv("TRELLIS_DBG_ALLOC"))
             fprintf(stderr, "      [c2s-alloc] nodes=%d  gallocr buffer = %.2f GB\n",
-                    ggml_graph_n_nodes(g), ggml_gallocr_get_buffer_size(alloc, 0) / 1e9);
+                    ggml_graph_n_nodes(g), ex.buffer_size() / 1e9);
         for (auto& [t, data] : inputs) ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
-        if (ggml_backend_graph_compute(m.backend, g) != GGML_STATUS_SUCCESS) throw std::runtime_error("c2s: compute failed");
+        if (ex.compute(g, "sparse.c2s") != GGML_STATUS_SUCCESS) throw std::runtime_error("c2s: compute failed");
         return tensor_to_f32(out);
     }
 };
 } // anon
+
+// Host-streamed SparseConvNeXt block. This is deliberately separate from the graph-builder
+// sparse_convnext() above: the latter is excellent for ordinary sparse levels, but for very
+// large stage-3 levels its chunk outputs are joined by a growing ggml_concat chain. The
+// allocator then has to reserve every prefix of that chain and a single block can become a
+// multi-GB monolith. Here every output chunk is an independent GraphRun, stitched on the host.
+// As with compact C2S, only feature columns actually referenced by this chunk's 27-neighbour
+// table are uploaded, so the full [C,N] sparse feature table never has to reside on the GPU.
+std::vector<float> sparse_convnext_streamed(const Model& m, const std::string& prefix,
+                                             const std::vector<float>& feats_in, int C,
+                                             const std::vector<int32_t>& nbr, int N) {
+    if (N <= 0 || C <= 0 || feats_in.size() != (size_t)C * N)
+        throw std::runtime_error("shape_dec: invalid streamed ConvNeXt input in " + prefix);
+    if (nbr.size() != (size_t)27 * N)
+        throw std::runtime_error("shape_dec: invalid streamed ConvNeXt neighbour table in " + prefix);
+
+    struct CompactNeighbors {
+        std::vector<int32_t> table;       // tap-major local indices, sentinel = globals.size()
+        std::vector<int32_t> globals;     // local column -> source column in feats_in
+    };
+    auto compact_neighbors = [](const std::vector<int32_t>& full, int full_n,
+                                int64_t r0, int nr, int sentinel) {
+        CompactNeighbors out;
+        out.table.resize((size_t)27 * nr);
+        std::unordered_map<int32_t, int32_t> remap;
+        remap.reserve((size_t)nr * 2 + 1);
+        for (int t = 0; t < 27; ++t) {
+            for (int j = 0; j < nr; ++j) {
+                const int32_t g = full[(size_t)t * full_n + (size_t)r0 + j];
+                if (g == sentinel) {
+                    out.table[(size_t)t * nr + j] = -1;
+                    continue;
+                }
+                auto it = remap.find(g);
+                if (it == remap.end()) {
+                    const int32_t li = (int32_t)out.globals.size();
+                    out.globals.push_back(g);
+                    remap.emplace(g, li);
+                    out.table[(size_t)t * nr + j] = li;
+                } else {
+                    out.table[(size_t)t * nr + j] = it->second;
+                }
+            }
+        }
+        const int32_t local_sentinel = (int32_t)out.globals.size();
+        for (int32_t& x : out.table) if (x < 0) x = local_sentinel;
+        return out;
+    };
+    auto gather_columns = [](const std::vector<float>& full, int ch,
+                             const std::vector<int32_t>& globals) {
+        std::vector<float> local((size_t)ch * (globals.size() + 1), 0.0f);
+        for (size_t li = 0; li < globals.size(); ++li) {
+            const size_t src = (size_t)ch * (size_t)globals[li];
+            std::copy_n(full.data() + src, ch, local.data() + (size_t)ch * li);
+        }
+        return local;
+    };
+
+    static constexpr int64_t kDefaultConvNextChunkBytes = 256ll * 1024 * 1024;
+    static constexpr int64_t kMaxConvNextStreamVoxels = 65536;
+    int64_t budget = kDefaultConvNextChunkBytes;
+    if (const char* e = getenv("TRELLIS_CONVNEXT_CHUNK_MB")) {
+        const int64_t mb = atoll(e);
+        if (mb > 0) budget = mb * 1024 * 1024;
+    }
+    // The MLP widens C -> 4C and is the widest voxel-local activation. Keep that wide
+    // activation near the requested budget, then cap output rows just like compact C2S.
+    const int64_t per_vox = std::max<int64_t>(1, 4ll * C * (int64_t)sizeof(float));
+    int64_t chunk = std::max<int64_t>(1, budget / per_vox);
+    if (chunk > kMaxConvNextStreamVoxels) chunk = kMaxConvNextStreamVoxels;
+    if (chunk > N) chunk = N;
+    const int64_t nchunks = (N + chunk - 1) / chunk;
+
+    if (getenv("TRELLIS_DBG_ALLOC"))
+        fprintf(stderr, "      [convnext-stream] %s C=%d N=%d chunks=%lldx%lld budget=%lld MB\n",
+                prefix.c_str(), C, N, (long long)nchunks, (long long)chunk,
+                (long long)(budget / (1024 * 1024)));
+
+    std::vector<float> out((size_t)C * N);
+    for (int64_t r0 = 0; r0 < N; r0 += chunk) {
+        const int nr = (int)std::min<int64_t>(chunk, N - r0);
+        CompactNeighbors cn = compact_neighbors(nbr, N, r0, nr, N);
+        std::vector<float> local = gather_columns(feats_in, C, cn.globals);
+
+        GraphRun gr(m);
+        ggml_context* c = gr.c;
+        const int nsrc = (int)cn.globals.size();
+        T* gh = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, nsrc + 1); ggml_set_input(gh);
+        T* gn = ggml_new_tensor_2d(c, GGML_TYPE_I32, nr, 27);      ggml_set_input(gn);
+        T* gres = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, nr);     ggml_set_input(gres);
+
+        T* Wc = w32(c, m.get(prefix + ".conv.weight"));
+        T* h = submconv_range(c, m, prefix + ".conv", gh, Wc, gn, nr, 0, nr);
+        h = ggml_norm(c, h, 1e-6f);
+        h = ggml_add(c, ggml_mul(c, h, m.get(prefix + ".norm.weight")),
+                     m.get(prefix + ".norm.bias"));
+        h = ggml_add(c, mul_mat_rows(c, m.get(prefix + ".mlp.0.weight"), h),
+                     m.get(prefix + ".mlp.0.bias"));
+        h = ggml_silu(c, h);
+        h = ggml_add(c, mul_mat_rows(c, m.get(prefix + ".mlp.2.weight"), h),
+                     m.get(prefix + ".mlp.2.bias"));
+        h = ggml_add(c, h, gres);
+
+        std::vector<float> hv;
+        try {
+            hv = gr.run(h, { {gh, local.data()}, {gn, cn.table.data()},
+                             {gres, feats_in.data() + (size_t)C * r0} });
+        } catch (const std::runtime_error& e) {
+            // GraphRun's generic label is c2s because it was originally introduced for C2S.
+            // Reclassify here so the caller/queue reports the subsystem that actually failed.
+            const std::string what = e.what();
+            if (what == "c2s: alloc failed") throw std::runtime_error("shape_dec alloc");
+            if (what == "c2s: compute failed") throw std::runtime_error("shape_dec compute");
+            throw;
+        }
+        std::copy(hv.begin(), hv.end(), out.begin() + (size_t)C * r0);
+    }
+    return out;
+}
 
 C2SResult sparse_c2s(const Model& m, const std::string& prefix,
                      const std::vector<float>& feats_in, int Cin,
@@ -189,12 +309,30 @@ C2SResult sparse_c2s(const Model& m, const std::string& prefix,
     std::vector<float> subdiv;
     if (!ext_subdiv) {
         auto predict_subdiv = [&]() {
-            GraphRun gr1(m);
-            ggml_context* c = gr1.c;
-            T* gf = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cin, N); ggml_set_input(gf);
-            T* sd = ggml_add(c, mul_mat_rows(c, m.get(prefix + ".to_subdiv.weight"), gf),
-                             m.get(prefix + ".to_subdiv.bias"));
-            return gr1.run(sd, { {gf, feats_in.data()} });   // [8, N] -- small
+            // to_subdiv is a voxel-local linear projection [Cin,N] -> [8,N].  Keeping the
+            // whole F32 input tensor on-device defeats C2S streaming for very dense shape
+            // decoder stages (e.g. Cin=128,N~4.5M is >2 GiB before any workspace).  Stream
+            // independent voxel ranges and stitch the tiny 8-channel logits on the host.
+            static constexpr int64_t kSubdivStreamVoxels = 65536;
+            std::vector<float> out((size_t)8 * N);
+            if (N > kSubdivStreamVoxels)
+                fprintf(stderr,
+                        "      [c2s-subdiv-stream] %s N=%d chunks=%lldx%lld\n",
+                        prefix.c_str(), N,
+                        (long long)((N + kSubdivStreamVoxels - 1) / kSubdivStreamVoxels),
+                        (long long)kSubdivStreamVoxels);
+
+            for (int64_t r0 = 0; r0 < N; r0 += kSubdivStreamVoxels) {
+                const int nr = (int)std::min<int64_t>(kSubdivStreamVoxels, (int64_t)N - r0);
+                GraphRun gr1(m);
+                ggml_context* c = gr1.c;
+                T* gf = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cin, nr); ggml_set_input(gf);
+                T* sd = ggml_add(c, ggml_mul_mat(c, m.get(prefix + ".to_subdiv.weight"), gf),
+                                 m.get(prefix + ".to_subdiv.bias"));
+                std::vector<float> sv = gr1.run(sd, { {gf, feats_in.data() + (size_t)Cin * r0} });
+                std::copy(sv.begin(), sv.end(), out.begin() + (size_t)8 * r0);
+            }
+            return out;
         };
         constexpr int kAttempts = 3;
         for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -252,111 +390,185 @@ C2SResult sparse_c2s(const Model& m, const std::string& prefix,
                 prefix.c_str(), N, M, (double)nnbr.size() * 4 / 1e9,
                 (double)feats_in.size() * 4 / 1e9, (double)Cout * M * 4 / 1e9);
 
-    // conv1 widens to Cout*8, so the whole [Cout*8, N] is the stage's largest tensor (2.5 GB at
-    // res-1024 stage 3). Materialising it whole and gathering afterwards keeps it live next to
-    // conv2's working set -- measured 10.1 GB for the stage. Chunking conv1 over input voxels
-    // and gathering each chunk on the spot bounds it to [Cout*8, nr] instead.
-    const int64_t per_vox = (int64_t)Cout * 8 * 4;
-    int64_t budget = kBlockChunkBytes;
-    if (const char* e = getenv("TRELLIS_C2S_CHUNK_MB")) budget = atoll(e) * 1024 * 1024;
-    int64_t chunk = std::max<int64_t>(1, budget / std::max<int64_t>(per_vox, 1));
-    constexpr int64_t kMaxChunks = 24;         // node-budget floor, as in sparse_convnext
-    if (chunk * kMaxChunks < N) chunk = (N + kMaxChunks - 1) / kMaxChunks;
-    if (chunk >= N) chunk = N;
-
-    // Per-chunk gather indices are chunk-local (the [Cout, 8*nr] reshape restarts at 0), so
-    // rebase once on the host: gloc[m] = gidx[m] - 8*r0 for m in this chunk's range.
-    std::vector<int32_t> gloc(M);
-    for (int64_t r0 = 0; r0 < N; r0 += chunk) {
-        const int64_t r1 = std::min<int64_t>(r0 + chunk, N);
-        for (int32_t mm = mstart[r0]; mm < mstart[r1]; ++mm) gloc[mm] = gidx[mm] - (int32_t)(8 * r0);
+    // ---- streamed C2S ---------------------------------------------------------
+    // The older implementation chunked conv1/conv2 logically but still built every chunk
+    // into ONE ggml graph. gallocr therefore reserved the aggregate lifetime of the whole
+    // graph, which defeats the memory cap and can request 10-20+ GB at res-1024.
+    //
+    // This path makes the chunk boundary a real allocation boundary: each normalization,
+    // conv1 and conv2 chunk gets its own GraphRun. The GraphRun is destroyed before the next
+    // chunk starts, so its gallocr buffer is released. Intermediate C2S features are stitched
+    // on the host. This trades some PCIe traffic for a bounded GPU working set -- exactly what
+    // the 16 GB Windows/Vulkan path needs.
+    static constexpr int64_t kDefaultC2SChunkBytes = 256ll * 1024 * 1024;
+    int64_t budget = kDefaultC2SChunkBytes;
+    if (const char* e = getenv("TRELLIS_C2S_CHUNK_MB")) {
+        const int64_t mb = atoll(e);
+        if (mb > 0) budget = mb * 1024 * 1024;
     }
 
-    // ---- graph 2: conv1 -> SparseChannel2Spatial -> conv2 + skip, entirely on device ----
-    GraphRun gr2(m);
-    ggml_context* c = gr2.c;
-    T* gf  = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cin, N); ggml_set_input(gf);
-    T* gn  = ggml_new_tensor_2d(c, GGML_TYPE_I32, N, 27);  ggml_set_input(gn);
-    T* gi  = ggml_new_tensor_1d(c, GGML_TYPE_I32, M);      ggml_set_input(gi);
-    T* gl  = ggml_new_tensor_1d(c, GGML_TYPE_I32, M);      ggml_set_input(gl);
-    T* gn2 = ggml_new_tensor_2d(c, GGML_TYPE_I32, M, 27);  ggml_set_input(gn2);
+    auto chunk_count = [](int64_t total, int64_t chunk_sz) -> int64_t {
+        return (total + chunk_sz - 1) / chunk_sz;
+    };
+    struct CompactNeighbors {
+        std::vector<int32_t> table;       // tap-major local indices, sentinel = globals.size()
+        std::vector<int32_t> globals;     // local column -> source column in the full host table
+    };
+    auto compact_neighbors = [](const std::vector<int32_t>& full, int full_n,
+                                int64_t r0, int nr, int sentinel) {
+        CompactNeighbors out;
+        out.table.resize((size_t)27 * nr);
+        // A streamed graph must not upload the full [C,N] feature table just because its
+        // neighbours are global indices. Compact the referenced columns for this output chunk
+        // and remap the neighbour table to that compact table. With a 65k output chunk this
+        // stays small even when the full post-subdivision stage has 10M+ voxels.
+        std::unordered_map<int32_t, int32_t> remap;
+        remap.reserve((size_t)nr * 2 + 1);
+        for (int t = 0; t < 27; ++t) {
+            for (int j = 0; j < nr; ++j) {
+                const int32_t g = full[(size_t)t * full_n + (size_t)r0 + j];
+                if (g == sentinel) {
+                    out.table[(size_t)t * nr + j] = -1;
+                    continue;
+                }
+                auto it = remap.find(g);
+                if (it == remap.end()) {
+                    const int32_t li = (int32_t)out.globals.size();
+                    out.globals.push_back(g);
+                    remap.emplace(g, li);
+                    out.table[(size_t)t * nr + j] = li;
+                } else {
+                    out.table[(size_t)t * nr + j] = it->second;
+                }
+            }
+        }
+        const int32_t local_sentinel = (int32_t)out.globals.size();
+        for (int32_t& x : out.table) if (x < 0) x = local_sentinel;
+        return out;
+    };
+    auto gather_columns = [](const std::vector<float>& full, int C,
+                             const std::vector<int32_t>& globals) {
+        std::vector<float> local((size_t)C * (globals.size() + 1), 0.0f);
+        for (size_t li = 0; li < globals.size(); ++li) {
+            const size_t src = (size_t)C * (size_t)globals[li];
+            std::copy_n(full.data() + src, C, local.data() + (size_t)C * li);
+        }
+        return local;
+    };
 
-    T* h = ggml_norm(c, gf, 1e-6f);
-    h = ggml_add(c, ggml_mul(c, h, m.get(prefix + ".norm1.weight")), m.get(prefix + ".norm1.bias"));
-    h = ggml_silu(c, h);
+    // norm1 + affine + SiLU are voxel-local. Do them in independent row chunks and keep the
+    // result on the host with one extra zero sentinel row. This also avoids submconv_pad's
+    // full-size device concat in every conv1 chunk.
+    const int64_t norm_bytes_per_vox = std::max<int64_t>(1, 4ll * Cin * (int64_t)sizeof(float));
+    int64_t norm_chunk = std::max<int64_t>(1, budget / norm_bytes_per_vox);
+    if (norm_chunk > N) norm_chunk = N;
 
-    // SparseChannel2Spatial(2). [Cout*8, nr] is contiguous, so octant o's slice of voxel i --
-    // channels (o*Cout .. o*Cout+Cout), at offset k + Cout*(o + 8*i) -- is exactly column
-    // (o + 8*i) of the free [Cout, 8*nr] reshape. The subdivision is then just a gather of the
-    // surviving columns: no host copy, no re-upload.
-    // Chunks are written into ONE [Cout, M+1] buffer rather than concat-chained: every
-    // ggml_concat allocates a new full-size tensor beside the old one, so a chain peaks at
-    // ~2x its result -- 16.7 GB for the cottage's [64, 32.7M]. ggml_pad seeds the buffer from
-    // chunk 0 and zero-fills the rest, so column M -- conv2's sentinel row, which absent
-    // neighbours index -- is already zero; norm2/silu map an all-zero column to zero
-    // (norm is (0-0)/sqrt(0+eps)=0, silu(0)=0), so it survives and submconv_pad's extra full
-    // copy of hn is gone too.
-    // ggml_cpy, not ggml_set_2d_inplace: SET keeps its byte offset in int32 op_params and
-    // asserts offset < 1<<30, which these multi-GB tensors blow past. A view carries a 64-bit
-    // pointer instead. Nothing reads the writes, so they are rooted explicitly via run()'s
-    // `roots`, expanded ahead of the consumers that follow them in the node array.
-    T* W1 = w32(c, m.get(prefix + ".conv1.weight"));
-    T* fz = submconv_pad(c, h, W1->ne[0]);          // built once, shared by every chunk
-    std::vector<T*> roots;
-    T* hraw = nullptr;
+    std::vector<float> hnorm((size_t)Cin * (N + 1), 0.0f);  // column N is the sentinel
+    for (int64_t r0 = 0; r0 < N; r0 += norm_chunk) {
+        const int nr = (int)std::min<int64_t>(norm_chunk, N - r0);
+        GraphRun gr(m);
+        ggml_context* c = gr.c;
+        T* gf = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cin, nr); ggml_set_input(gf);
+        T* h = ggml_norm(c, gf, 1e-6f);
+        h = ggml_add(c, ggml_mul(c, h, m.get(prefix + ".norm1.weight")),
+                     m.get(prefix + ".norm1.bias"));
+        h = ggml_silu(c, h);
+        std::vector<float> hv = gr.run(h, { {gf, feats_in.data() + (size_t)Cin * r0} });
+        std::copy(hv.begin(), hv.end(), hnorm.begin() + (size_t)Cin * r0);
+    }
+
+    // conv1 widens to Cout*8. Each input-voxel range maps to a contiguous output range
+    // [mstart[r0], mstart[r1]), so we can gather the surviving octants immediately, apply
+    // norm2+SiLU immediately, read that chunk back, and discard the graph before moving on.
+    const int64_t per_vox = std::max<int64_t>(1, (int64_t)Cout * 8 * (int64_t)sizeof(float));
+    int64_t chunk = std::max<int64_t>(1, budget / per_vox);
+    // submconv has 27 gathers/matmuls; the output tensor alone is not a useful estimate of
+    // its real Vulkan working set. Keep each streamed conv graph comfortably below the
+    // multi-GB allocations seen on 16 GB cards.
+    static constexpr int64_t kMaxC2SStreamVoxels = 65536;
+    if (chunk > kMaxC2SStreamVoxels) chunk = kMaxC2SStreamVoxels;
+    if (chunk > N) chunk = N;
+
+    std::vector<float> hn((size_t)Cout * (M + 1), 0.0f);   // host table; column M is sentinel
     for (int64_t r0 = 0; r0 < N; r0 += chunk) {
         const int64_t r1 = std::min<int64_t>(r0 + chunk, N);
-        const int32_t m0 = mstart[r0], m1 = mstart[r1];
-        if (m1 == m0) continue;                     // no octant of this chunk survived
-        T* cvc = submconv_range(c, m, prefix + ".conv1", fz, W1, gn, N, (int)r0, (int)(r1 - r0));
-        T* idx = ggml_cont(c, ggml_view_1d(c, gl, m1 - m0, (size_t)m0 * ggml_element_size(gl)));
-        T* hc  = ggml_get_rows(c, ggml_reshape_2d(c, cvc, Cout, 8 * (r1 - r0)), idx);   // [Cout, m1-m0]
-        if (!hraw) { hraw = ggml_pad(c, hc, 0, (int)(M + 1 - (m1 - m0)), 0, 0); continue; }  // [Cout, M+1]
-        roots.push_back(ggml_cpy(c, hc, ggml_view_2d(c, hraw, Cout, m1 - m0,
-                                                     hraw->nb[1], (size_t)m0 * hraw->nb[1])));
+        const int nr = (int)(r1 - r0);
+        const int32_t m0 = mstart[(size_t)r0], m1 = mstart[(size_t)r1];
+        if (m1 == m0) continue;
+        const int mc = m1 - m0;
+
+        CompactNeighbors cn = compact_neighbors(nbr, N, r0, nr, N);
+        std::vector<float> hnorm_local = gather_columns(hnorm, Cin, cn.globals);
+        std::vector<int32_t> idx_local((size_t)mc);
+        for (int j = 0; j < mc; ++j)
+            idx_local[(size_t)j] = gidx[(size_t)m0 + j] - (int32_t)(8 * r0);
+
+        GraphRun gr(m);
+        ggml_context* c = gr.c;
+        const int nsrc = (int)cn.globals.size();
+        T* gh = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cin, nsrc + 1); ggml_set_input(gh);
+        T* gn = ggml_new_tensor_2d(c, GGML_TYPE_I32, nr, 27);         ggml_set_input(gn);
+        T* gi = ggml_new_tensor_1d(c, GGML_TYPE_I32, mc);             ggml_set_input(gi);
+
+        T* W1 = w32(c, m.get(prefix + ".conv1.weight"));
+        T* cvc = submconv_range(c, m, prefix + ".conv1", gh, W1, gn, nr, 0, nr);
+        T* hc = ggml_get_rows(c, ggml_reshape_2d(c, cvc, Cout, (int64_t)8 * nr), gi);
+        hc = ggml_silu(c, ggml_norm(c, hc, 1e-6f));
+
+        std::vector<float> hv = gr.run(hc, { {gh, hnorm_local.data()}, {gn, cn.table.data()},
+                                              {gi, idx_local.data()} });
+        std::copy(hv.begin(), hv.end(), hn.begin() + (size_t)Cout * m0);
     }
-    T* hn = ggml_silu(c, ggml_norm(c, hraw, 1e-6f));                  // norm2, no affine
 
-    // conv2 runs at the POST-subdivision count M, which is where a dense object lives: the
-    // cottage hits M=32.7M, and unchunked each of the 27 taps builds full [Cout, M] gather /
-    // matmul / accumulator tensors, while mul_mat_rows' own 1M-row split concats 33 pieces
-    // into a chain that peaks near 2x the output. Chunking over OUTPUT voxels fixes both --
-    // the gather still reads the whole (padded) hn, since a neighbour can be any voxel, but
-    // the output is per-voxel so a range needs no halo. Keeping chunks <= mul_mat_rows'
-    // 1M-row threshold also stops it splitting internally, removing that concat chain.
-    // skip rides along per chunk: x channel2spatial'd by the same gather ([Cin,N] -> [K,M]),
-    // then repeat_interleave(R). [1,K,nr] -> repeat -> [R,K,nr] lays element (r,k,m) at
-    // r + R*k + R*K*m, so the [Cout,nr] reshape maps channel k*R+r -> k: interleave, not tile.
-    T* W2  = w32(c, m.get(prefix + ".conv2.weight"));
-    T* fz2 = hn;                                  // already [Cout, M+1]: pre-padded above
-    T* xs  = ggml_get_rows(c, ggml_reshape_2d(c, gf, K, (int64_t)8 * N), gi);     // [K, M]
-
-    const int64_t per_vox2 = 3 * (int64_t)Cout * 4;   // acc + gather + matmul, live per tap
-    int64_t chunk2 = std::max<int64_t>(1, budget / std::max<int64_t>(per_vox2, 1));
+    // conv2 is streamed over POST-subdivision voxels. Neighbours are global on the host, but
+    // each chunk compacts just the referenced feature columns and remaps its neighbour table,
+    // so the GPU never receives the full [Cout,M] table. There is deliberately no full
+    // [Cout,M] device input or output: each chunk is read back and stitched into `outv`.
+    const int64_t per_vox2 = std::max<int64_t>(1, 3ll * Cout * (int64_t)sizeof(float));
+    int64_t chunk2 = std::max<int64_t>(1, budget / per_vox2);
+    if (chunk2 > kMaxC2SStreamVoxels) chunk2 = kMaxC2SStreamVoxels;
     if (chunk2 > kMulMatRowChunk) chunk2 = kMulMatRowChunk;
-    constexpr int64_t kMaxChunks2 = 64;               // ~135 nodes/chunk, well under kGraphNodes
-    if (chunk2 * kMaxChunks2 < M) chunk2 = (M + kMaxChunks2 - 1) / kMaxChunks2;
-    if (chunk2 >= M) chunk2 = M;
+    if (chunk2 > M) chunk2 = M;
 
-    T* out = nullptr;
+    if (getenv("TRELLIS_DBG_ALLOC"))
+        fprintf(stderr,
+                "      [c2s-stream] %s budget=%lld MB norm=%lldx%lld conv1=%lldx%lld conv2=%lldx%lld\n",
+                prefix.c_str(), (long long)(budget / (1024 * 1024)),
+                (long long)chunk_count(N, norm_chunk), (long long)norm_chunk,
+                (long long)chunk_count(N, chunk), (long long)chunk,
+                (long long)chunk_count(M, chunk2), (long long)chunk2);
+
+    std::vector<float> outv((size_t)Cout * M);
     for (int64_t m0 = 0; m0 < M; m0 += chunk2) {
-        const int64_t nr2 = std::min<int64_t>(chunk2, M - m0);
-        T* o = submconv_range(c, m, prefix + ".conv2", fz2, W2, gn2, M, (int)m0, (int)nr2);
-        T* xr = (m0 == 0 && nr2 == M) ? xs
-                : ggml_cont(c, ggml_view_2d(c, xs, K, nr2, xs->nb[1], (size_t)m0 * xs->nb[1]));
-        T* skr = ggml_repeat_4d(c, ggml_reshape_3d(c, xr, 1, K, nr2), R, K, nr2, 1);
-        o = ggml_add(c, o, ggml_reshape_2d(c, skr, Cout, nr2));
-        // written into one [Cout, M] buffer, as for hraw above -- a concat chain here would
-        // again peak at 2x the 8.4 GB output. Every column is covered by some chunk, so the
-        // pad's zero fill is overwritten and only sizes the buffer.
-        if (!out) { out = ggml_pad(c, o, 0, (int)(M - nr2), 0, 0); continue; }   // [Cout, M]
-        roots.push_back(ggml_cpy(c, o, ggml_view_2d(c, out, Cout, nr2,
-                                                    out->nb[1], (size_t)m0 * out->nb[1])));
+        const int nr2 = (int)std::min<int64_t>(chunk2, M - m0);
+        CompactNeighbors cn = compact_neighbors(nnbr, M, m0, nr2, M);
+        std::vector<float> hn_local = gather_columns(hn, Cout, cn.globals);
+
+        GraphRun gr(m);
+        ggml_context* c = gr.c;
+        const int nsrc = (int)cn.globals.size();
+        T* gh = ggml_new_tensor_2d(c, GGML_TYPE_F32, Cout, nsrc + 1); ggml_set_input(gh);
+        T* gn = ggml_new_tensor_2d(c, GGML_TYPE_I32, nr2, 27);         ggml_set_input(gn);
+        T* W2 = w32(c, m.get(prefix + ".conv2.weight"));
+        T* o = submconv_range(c, m, prefix + ".conv2", gh, W2, gn, nr2, 0, nr2);
+
+        std::vector<float> ov = gr.run(o, { {gh, hn_local.data()}, {gn, cn.table.data()} });
+
+        // Skip path on host: channel2spatial(raw x) followed by repeat_interleave(R).
+        // gidx[m] is the selected column in reshape(raw_x, [K, 8N]).
+        for (int j = 0; j < nr2; ++j) {
+            const int64_t mm = m0 + j;
+            const int32_t src_col = gidx[(size_t)mm];
+            for (int k = 0; k < K; ++k) {
+                const float sv = feats_in[(size_t)K * src_col + k];
+                const int c0 = k * R;
+                for (int r = 0; r < R; ++r)
+                    ov[(size_t)Cout * j + c0 + r] += sv;
+            }
+        }
+        std::copy(ov.begin(), ov.end(), outv.begin() + (size_t)Cout * m0);
     }
 
-    std::vector<float> outv = gr2.run(out, { {gf, feats_in.data()}, {gn, nbr.data()},
-                                             {gi, gidx.data()}, {gl, gloc.data()}, {gn2, nnbr.data()} },
-                                      roots);
     return { std::move(outv), std::move(nc), Cout, std::move(mask_used) };
 }
 

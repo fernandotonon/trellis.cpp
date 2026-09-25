@@ -2,6 +2,8 @@
 // roll / attention mask are precomputed on the host as gather/scatter index arrays + an additive
 // mask, applied via ggml_get_rows. Validated against tools/ref_birefnet.py dumps.
 #include "birefnet.h"
+#include "trellis_debug.h"
+#include "trellis_sched.h"
 #include "deform_conv.h"
 #include "trellis_model.h"
 #include "ggml.h"
@@ -33,17 +35,12 @@ static std::vector<std::vector<float>> run_graph(const Model& m, ggml_context* c
                       std::vector<std::pair<T*, const void*>> ins, size_t nodes = 16384) {
     ggml_cgraph* g = ggml_new_graph_custom(c, nodes, false);
     for (T* o : outs) { ggml_set_output(o); ggml_build_forward_expand(g, o); }
-    ggml_gallocr_t a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!ggml_gallocr_alloc_graph(a, g)) throw std::runtime_error("birefnet alloc");
-    if (getenv("TRELLIS_DBG_ALLOC"))
-        fprintf(stderr, "      [birefnet-alloc] %-48s nodes=%d buffer=%.3f GB\n",
-                outs.empty() ? "" : ggml_get_name(outs.front()), ggml_graph_n_nodes(g),
-                ggml_gallocr_get_buffer_size(a, 0) / 1e9);
+    trellis::GraphExec ex(m);
+    if (!ex.alloc(g)) throw std::runtime_error("birefnet alloc");
     for (auto& [t, d] : ins) ggml_backend_tensor_set(t, d, 0, ggml_nbytes(t));
-    if (ggml_backend_graph_compute(m.backend, g) != GGML_STATUS_SUCCESS) throw std::runtime_error("birefnet compute");
+    if (ex.compute(g, "birefnet") != GGML_STATUS_SUCCESS) throw std::runtime_error("birefnet compute");
     std::vector<std::vector<float>> r;
-    for (T* o : outs) r.push_back(tensor_to_f32(o));
-    ggml_gallocr_free(a);
+    for (T* o : outs) r.push_back(tensor_to_f32(o));   // read before ex releases the buffers
     return r;
 }
 

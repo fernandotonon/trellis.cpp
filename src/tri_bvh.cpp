@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <unordered_map>
 
 namespace trellis {
 
@@ -46,6 +48,22 @@ void closest_on_tri(const float* p, const float* a, const float* b, const float*
     for (int k = 0; k < 3; ++k) out[k] = a[k] + ab[k]*v + ac[k]*w;
 }
 
+size_t bvh_node_count_memo(int64_t n, std::unordered_map<int64_t, size_t>& memo) {
+    if (n <= 4) return 1;
+    auto it = memo.find(n);
+    if (it != memo.end()) return it->second;
+    const int64_t a = n / 2, b = n - a;
+    const size_t count = 1 + bvh_node_count_memo(a, memo) + bvh_node_count_memo(b, memo);
+    memo.emplace(n, count);
+    return count;
+}
+
+size_t bvh_node_count(int64_t n) {
+    std::unordered_map<int64_t, size_t> memo;
+    memo.reserve(64);
+    return bvh_node_count_memo(n, memo);
+}
+
 inline float box_dist2(const float* p, const float* bmin, const float* bmax) {
     float d2 = 0.f;
     for (int k = 0; k < 3; ++k) {
@@ -70,7 +88,19 @@ TriBvh TriBvh::build(const float* verts, int64_t V, const int32_t* faces, int64_
         for (int k = 0; k < 3; ++k)
             cent[3*f+k] = (verts[3*faces[3*f]+k] + verts[3*faces[3*f+1]+k] + verts[3*faces[3*f+2]+k]) / 3.f;
     }
-    t.nodes_.reserve((size_t)F * 2);
+    // The old 2*F reserve is a severe over-allocation on giant decoded meshes.
+    // With leaf size 4 the balanced tree needs far fewer nodes; compute the exact
+    // count so vector growth never creates a second multi-GiB copy either.
+    const size_t node_need = bvh_node_count(F);
+    t.nodes_.reserve(node_need);
+    if (F >= 1000000) {
+        const double work_gib = ((double)node_need * sizeof(Node) +
+                                 (double)F * sizeof(int32_t) +
+                                 (double)F * 3.0 * sizeof(float)) / (1024.0*1024.0*1024.0);
+        printf("  [bvh-mem] F=%lld nodes=%zu build-working~%.2f GiB\n",
+               (long long)F, node_need, work_gib);
+        fflush(stdout);
+    }
 
     struct Span { int32_t node, begin, end; };
     std::vector<Span> stack;
@@ -117,6 +147,10 @@ TriBvh TriBvh::build(const float* verts, int64_t V, const int32_t* faces, int64_
 }
 
 TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
+    return closest_filtered(p, nullptr, nullptr, max_dist);
+}
+
+TriBvh::Hit TriBvh::closest_filtered(const float p[3], PointFilter accept, void *context, float max_dist) const {
     Hit hit;
     if (nodes_.empty()) return hit;
     hit.dist2 = max_dist * max_dist;
@@ -135,7 +169,7 @@ TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
                 closest_on_tri(p, &verts_[3*faces_[3*f]], &verts_[3*faces_[3*f+1]], &verts_[3*faces_[3*f+2]], q);
                 const float dx = q[0]-p[0], dy = q[1]-p[1], dz = q[2]-p[2];
                 const float d2 = dx*dx + dy*dy + dz*dz;
-                if (d2 < hit.dist2) {
+                if (d2 < hit.dist2 && (!accept || accept(context, f, q))) {
                     hit.dist2 = d2;
                     hit.face = f;
                     std::memcpy(hit.point, q, 12);
@@ -154,6 +188,41 @@ TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
         }
     }
     return hit;
+}
+
+bool TriBvh::visit_overlapping(const float bmin[3], const float bmax[3], BoxVisitor visit, void *context) const {
+    if (nodes_.empty()) return true;
+    int32_t stack[64];
+    int size = 0;
+    stack[size++] = 0;
+    while (size) {
+        const Node& node = nodes_[stack[--size]];
+        bool overlap = true;
+        for (int k = 0; k < 3; ++k)
+            overlap &= bmin[k] <= node.bmax[k] && node.bmin[k] <= bmax[k];
+        if (!overlap) continue;
+        if (node.count) {
+            for (int32_t i = 0; i < node.count; ++i) {
+                const int32_t face = prim_[node.left+i];
+                bool triangle_overlap = true;
+                for (int k = 0; k < 3; ++k) {
+                    float lo = 1e30f, hi = -1e30f;
+                    for (int j = 0; j < 3; ++j) {
+                        const float x = verts_[3*faces_[3*face+j]+k];
+                        lo = std::min(lo, x);
+                        hi = std::max(hi, x);
+                    }
+                    triangle_overlap &= bmin[k] <= hi && lo <= bmax[k];
+                }
+                if (triangle_overlap && !visit(context, face)) return false;
+            }
+        } else {
+            if (size + 2 > 64) return false;
+            stack[size++] = node.left;
+            stack[size++] = node.left+1;
+        }
+    }
+    return true;
 }
 
 }  // namespace trellis

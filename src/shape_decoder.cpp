@@ -1,4 +1,6 @@
 #include "shape_decoder.h"
+#include "trellis_debug.h"
+#include "trellis_sched.h"
 #include "sparse.h"
 #include "trellis_model.h"
 #include "ggml.h"
@@ -6,6 +8,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <stdexcept>
 
@@ -36,16 +39,15 @@ static std::vector<float> run1(const Model& m, ggml_context* c, T* out,
     ggml_set_output(out);
     ggml_cgraph* g = ggml_new_graph_custom(c, kGraphNodes, false);
     ggml_build_forward_expand(g, out);
-    ggml_gallocr_t a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!ggml_gallocr_alloc_graph(a, g)) throw std::runtime_error("shape_dec alloc");
+    trellis::GraphExec ex(m);
+    if (!ex.alloc(g)) throw std::runtime_error("shape_dec alloc");
     if (getenv("TRELLIS_DBG_ALLOC"))
         fprintf(stderr, "      [stage-alloc] nodes=%d  gallocr buffer = %.2f GB\n",
-                ggml_graph_n_nodes(g), ggml_gallocr_get_buffer_size(a, 0) / 1e9);
+                ggml_graph_n_nodes(g), ex.buffer_size() / 1e9);
     for (auto& [t, d] : ins) ggml_backend_tensor_set(t, d, 0, ggml_nbytes(t));
-    if (ggml_backend_graph_compute(m.backend, g) != GGML_STATUS_SUCCESS) throw std::runtime_error("shape_dec compute");
+    if (ex.compute(g, "shape_decode") != GGML_STATUS_SUCCESS) throw std::runtime_error("shape_dec compute");
     mem_probe("run1 computed (pre-readback)");
     std::vector<float> r = tensor_to_f32(out);
-    ggml_gallocr_free(a);
     mem_probe("run1 freed (post-readback)");
     return r;
 }
@@ -94,15 +96,54 @@ static std::vector<float> decode_unet(const Model& m, const std::vector<float>& 
         if (getenv("TRELLIS_DBG_MEM"))
             fprintf(stderr, "    == stage %d: C=%d nblk=%d N=%d | host h=%.2f GB nbr=%.2f GB\n",
                     si, st.C, st.nblk, N, (double)h.size() * 4 / 1e9, (double)nbr.size() * 4 / 1e9);
-        {   // ConvNeXt stage
-            ggml_context* c = mkctx();
-            T* gh = ggml_new_tensor_2d(c, GGML_TYPE_F32, st.C, N); ggml_set_input(gh);
-            T* gn = ggml_new_tensor_2d(c, GGML_TYPE_I32, N, 27);   ggml_set_input(gn);
-            T* x = gh;
-            for (int j = 0; j < st.nblk; ++j)
-                x = sparse_convnext(c, m, std::string("blocks.") + st.s + "." + std::to_string(j), x, gn, N);
-            h = run1(m, c, x, { {gh, h.data()}, {gn, nbr.data()} });
-            ggml_free(c);
+        {   // ConvNeXt stage. Once the full stage input itself reaches ~2 GiB, the old
+            // sparse_convnext concat chain multiplies that residency several-fold (the real
+            // stage-3 failure reserved 31.36 GB). Go straight to true chunk-local streaming
+            // for that case instead of deliberately provoking an OOM first. Smaller stages
+            // keep the fast whole-stage graph, with an allocation-failure fallback as a safety net.
+            size_t stream_at = 2ull * 1024 * 1024 * 1024;
+            if (const char* e = getenv("TRELLIS_CONVNEXT_STREAM_GB")) {
+                const double gb = atof(e);
+                if (gb > 0.0) stream_at = (size_t)(gb * 1024.0 * 1024.0 * 1024.0);
+            }
+            const size_t feature_bytes = (size_t)st.C * (size_t)N * sizeof(float);
+            const bool force_stream = getenv("TRELLIS_CONVNEXT_STREAM_ALL") != nullptr;
+            bool stream_stage = force_stream || feature_bytes >= stream_at;
+
+            if (!stream_stage) {
+                // The host vector `h` is only assigned after a successful run1(), so it remains
+                // the stage input if the fast-path allocation fails.
+                ggml_context* c = mkctx();
+                try {
+                    T* gh = ggml_new_tensor_2d(c, GGML_TYPE_F32, st.C, N); ggml_set_input(gh);
+                    T* gn = ggml_new_tensor_2d(c, GGML_TYPE_I32, N, 27);   ggml_set_input(gn);
+                    T* x = gh;
+                    for (int j = 0; j < st.nblk; ++j)
+                        x = sparse_convnext(c, m, std::string("blocks.") + st.s + "." + std::to_string(j), x, gn, N);
+                    std::vector<float> fast = run1(m, c, x, { {gh, h.data()}, {gn, nbr.data()} });
+                    ggml_free(c); c = nullptr;
+                    h = std::move(fast);
+                } catch (const std::runtime_error& e) {
+                    if (c) ggml_free(c);
+                    if (std::string(e.what()) != "shape_dec alloc") throw;
+                    stream_stage = true;
+                    fprintf(stderr,
+                            "      [shape-dec-stream] stage %d C=%d N=%d whole-stage alloc failed; "
+                            "retrying streamed\n", si, st.C, N);
+                }
+            } else if (getenv("TRELLIS_DBG_ALLOC")) {
+                fprintf(stderr,
+                        "      [shape-dec-stream] stage %d C=%d N=%d feature-table=%.2f GiB "
+                        ">= %.2f GiB; streaming\n",
+                        si, st.C, N, feature_bytes / 1073741824.0, stream_at / 1073741824.0);
+            }
+
+            if (stream_stage) {
+                for (int j = 0; j < st.nblk; ++j) {
+                    const std::string bp = std::string("blocks.") + st.s + "." + std::to_string(j);
+                    h = sparse_convnext_streamed(m, bp, h, st.C, nbr, N);
+                }
+            }
         }
         mem_probe("after ConvNeXt stage");
         const std::vector<uint8_t>* ext = guide_subs ? &(*guide_subs)[si] : nullptr;

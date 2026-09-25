@@ -1,8 +1,14 @@
 // Minimal glTF 2.0 binary (.glb) writer — geometry only (POSITION + indices).
 #pragma once
 #include <cstdint>
+#include <vector>
 
 namespace trellis {
+
+// Area-weighted smooth normals over exact-position welded vertices, in glTF's
+// coordinate frame. Shared by triangle GLB and textured quad OBJ consumers.
+std::vector<float> welded_normals_gltf(const float* gltf_positions, int64_t V,
+                                       const int32_t* faces, int64_t F);
 
 // verts: [V*3] float32 in TRELLIS world space ([-0.5,0.5]^3); faces: [F*3] int32.
 // Applies the TRELLIS->glTF rotation (x,y,z)->(x,z,-y) and writes a single-mesh GLB.

@@ -11,6 +11,7 @@ struct ggml_context;
 struct gguf_context;
 struct ggml_backend;
 struct ggml_backend_buffer;
+struct ggml_backend_sched;
 
 namespace trellis {
 
@@ -20,7 +21,15 @@ struct Model {
     gguf_context*         gguf   = nullptr;  // KV metadata + tensor table
     ggml_context*         meta   = nullptr;  // owns the ggml_tensor structs
     ggml_backend*         backend = nullptr; // where weights live
-    ggml_backend_buffer*  buffer = nullptr;  // the weight buffer
+    ggml_backend_buffer*  buffer = nullptr;  // weights in the backend's default buffer
+    // Optional backend-specific buffer for repacked quantized matrix weights.
+    ggml_backend_buffer*  buffer_repack = nullptr;
+    ggml_context*         ctx_host   = nullptr;   // owns the tensors in `buffer`
+    ggml_context*         ctx_repack = nullptr;   // owns the tensors in `buffer_repack`
+    // Multi-backend scheduler over [backend, ...fallbacks]. Non-null only when the
+    // primary backend has partial op coverage (e.g. the Hexagon NPU), in which case every
+    // graph runs through it so unsupported ops land on a backend that can execute them.
+    ggml_backend_sched*   sched  = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
     std::string arch;          // general.architecture
     std::string config_json;   // trellis.config_json (raw model config)

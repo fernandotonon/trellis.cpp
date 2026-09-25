@@ -23,6 +23,13 @@ ggml_tensor* sparse_submconv(ggml_context* c, const Model& m, const std::string&
 // SparseConvNeXtBlock3d: conv -> rowLN(affine,1e-6) -> Linear(C,4C)->SiLU->Linear(4C,C) -> + input.
 ggml_tensor* sparse_convnext(ggml_context* c, const Model& m, const std::string& prefix,
                              ggml_tensor* feats, ggml_tensor* nbr, int N);
+// Host-streamed ConvNeXt block for very large sparse levels. The output is identical in
+// layout to sparse_convnext, but each voxel chunk is a separate short-lived GPU graph and
+// only referenced neighbour feature columns are uploaded. This avoids the growing concat
+// chain / full sparse-table residency that can make stage-3 shape decode request 20-30+ GB.
+std::vector<float> sparse_convnext_streamed(const Model& m, const std::string& prefix,
+                                             const std::vector<float>& feats_in, int C,
+                                             const std::vector<int32_t>& nbr, int N);
 
 // SparseResBlockC2S3d up-block (channel->spatial ×2). Host-orchestrated (subdiv readback).
 // feats_in: [Cin*N] channel-major; returns new feats [Cout*M] + new coords (res ×2).

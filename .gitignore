@@ -23,6 +23,7 @@ __pycache__/
 
 # scratch
 /out/
+/.codex/
 *.glb
 !assets/showcase/*/*.glb
 *.tmp

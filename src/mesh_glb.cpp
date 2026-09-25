@@ -275,24 +275,8 @@ bool write_glb(const char* path, const float* verts, int64_t V, const int32_t* f
     return ok;
 }
 
-bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
-                        const int32_t* faces, int64_t F,
-                        const unsigned char* base_rgba, const unsigned char* mr_rgba, int T,
-                        bool double_sided, int64_t seed, const char* copyright, bool use_webp) {
-    // rotate positions (x,z,-y) + min/max
-    std::vector<float> pos((size_t)V*3);
-    float mn[3]={FLT_MAX,FLT_MAX,FLT_MAX}, mx[3]={-FLT_MAX,-FLT_MAX,-FLT_MAX};
-    for (int64_t i=0;i<V;++i){ float ox=verts[3*i],oy=verts[3*i+1],oz=verts[3*i+2]; float p[3]={ox,oz,-oy};
-        for(int c=0;c<3;++c){pos[3*i+c]=p[c]; mn[c]=std::min(mn[c],p[c]); mx[c]=std::max(mx[c],p[c]);} }
-    if (V==0){mn[0]=mn[1]=mn[2]=0;mx[0]=mx[1]=mx[2]=0;}
-
-    // area-weighted vertex normals (in the rotated frame) so viewers shade
-    // smoothly instead of the glTF-mandated flat fallback.
-    // Accumulate on POSITION-WELDED groups: xatlas duplicates vertices along UV
-    // seams, and per-copy normals would only see their own chart's faces --
-    // every chart border then becomes a shading crease and each chart reads as
-    // its own facet ("patchy skin"). The reference computes normals on the
-    // welded mesh before the UV split; welding by exact position matches that.
+std::vector<float> welded_normals_gltf(const float* pos, int64_t V,
+                                       const int32_t* faces, int64_t F) {
     std::vector<int64_t> rep((size_t)V);
     {
         struct KeyHash {
@@ -327,6 +311,20 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         const int64_t r=rep[i];
         if (r != i) for(int k=0;k<3;++k) nrm[3*i+k]=nrm[3*r+k];
     }
+    return nrm;
+}
+
+bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
+                        const int32_t* faces, int64_t F,
+                        const unsigned char* base_rgba, const unsigned char* mr_rgba, int T,
+                        bool double_sided, int64_t seed, const char* copyright, bool use_webp) {
+    // rotate positions (x,z,-y) + min/max
+    std::vector<float> pos((size_t)V*3);
+    float mn[3]={FLT_MAX,FLT_MAX,FLT_MAX}, mx[3]={-FLT_MAX,-FLT_MAX,-FLT_MAX};
+    for (int64_t i=0;i<V;++i){ float ox=verts[3*i],oy=verts[3*i+1],oz=verts[3*i+2]; float p[3]={ox,oz,-oy};
+        for(int c=0;c<3;++c){pos[3*i+c]=p[c]; mn[c]=std::min(mn[c],p[c]); mx[c]=std::max(mx[c],p[c]);} }
+    if (V==0){mn[0]=mn[1]=mn[2]=0;mx[0]=mx[1]=mx[2]=0;}
+    const auto nrm=welded_normals_gltf(pos.data(),V,faces,F);
 
     // encode textures — lossy WebP at the reference's quality when available,
     // PNG otherwise
