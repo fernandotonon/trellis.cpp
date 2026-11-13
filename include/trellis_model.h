@@ -15,6 +15,11 @@ struct ggml_backend_sched;
 
 namespace trellis {
 
+// Quantized 2D weights whose contraction dim (ne0) is below this are expanded to F16 at load.
+// ggml-vulkan's integer-dot Q8_0 matmul miscomputes K = 32/64 on RDNA2 + the AMD Windows
+// driver (issue #50); K >= 128 was measured fine. tools/quantize_gguf.py uses the same bound.
+constexpr int64_t kMinQuantK = 128;
+
 // A loaded GGUF: tensor metadata (ggml_context), the weights uploaded to a
 // backend buffer (CUDA or CPU), and a name -> tensor lookup. One per checkpoint.
 struct Model {

@@ -270,6 +270,28 @@ Model Model::load(const std::string& path, int gpu) {
         fprintf(stderr, "[trellis] %s: restored %d reshaped tensor(s) from orig_shape metadata\n",
                 path.c_str(), fixed);
 
+    // Quantized matrices with a short contraction dim are uploaded as F16 instead.
+    // ggml-vulkan's integer-dot Q8_0 matmul returns NaN rows for K = 32 and 64 on RDNA2 with
+    // the AMD Windows driver (issue #50: the q8 GGUFs' 32->1536 / 64->1536 / 32->1024 latent
+    // projections turned every flow forward into NaN; K >= 128 measured fine). These tensors
+    // are a few hundred KB per file and quantizing them saves nothing, so expand them on
+    // every backend. TRELLIS_KEEP_SMALL_K_QUANT=1 keeps them quantized (A/B against the bug).
+    std::map<std::string, ggml_type> expanded;   // name -> on-disk type, converted while streaming
+    if (!std::getenv("TRELLIS_KEEP_SMALL_K_QUANT")) {
+        for (int64_t i = 0; i < gguf_get_n_tensors(m.gguf); ++i) {
+            ggml_tensor* t = ggml_get_tensor(meta, gguf_get_tensor_name(m.gguf, i));
+            if (!t || !ggml_is_quantized(t->type) || ggml_n_dims(t) != 2 || t->ne[0] >= kMinQuantK) continue;
+            if (!ggml_get_type_traits(t->type)->to_float) continue;
+            expanded[ggml_get_name(t)] = t->type;
+            t->type  = GGML_TYPE_F16;
+            t->nb[0] = ggml_type_size(GGML_TYPE_F16);
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+        }
+        if (!expanded.empty() && verbose())
+            fprintf(stderr, "[trellis:dbg] %s: %zu small-K quantized tensor(s) -> F16\n",
+                    path.substr(path.find_last_of("/\\") + 1).c_str(), expanded.size());
+    }
+
     m.backend = shared_backend(gpu);
     m.on_gpu  = !ggml_backend_is_cpu(m.backend);
 
@@ -365,7 +387,8 @@ Model Model::load(const std::string& path, int gpu) {
         ggml_tensor* t = m.ctx_repack ? ggml_get_tensor(m.ctx_repack, name) : nullptr;
         if (!t && m.ctx_host) t = ggml_get_tensor(m.ctx_host, name);
         if (!t) t = ggml_get_tensor(meta, name);
-        const size_t nbytes = ggml_nbytes(t);
+        const auto exp = expanded.find(name);
+        const size_t nbytes = exp == expanded.end() ? ggml_nbytes(t) : gguf_get_tensor_size(m.gguf, i);
         const size_t off = data_off + gguf_get_tensor_offset(m.gguf, i);
         staging.resize(nbytes);
         if (trellis_fseek64(f, (int64_t)off, SEEK_SET) != 0 ||
@@ -373,7 +396,16 @@ Model Model::load(const std::string& path, int gpu) {
             fclose(f);
             throw std::runtime_error(std::string("short read for tensor ") + name);
         }
-        ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
+        if (exp != expanded.end()) {   // on-disk quantized -> F16 (see kMinQuantK above)
+            const int64_t ne = ggml_nelements(t);
+            std::vector<float> f32(ne);
+            ggml_get_type_traits(exp->second)->to_float(staging.data(), f32.data(), ne);
+            std::vector<ggml_fp16_t> f16(ne);
+            ggml_fp32_to_fp16_row(f32.data(), f16.data(), ne);
+            ggml_backend_tensor_set(t, f16.data(), 0, ggml_nbytes(t));
+        } else {
+            ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
+        }
         m.tensors[name] = t;
     }
     fclose(f);

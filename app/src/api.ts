@@ -1,6 +1,6 @@
 // HTTP client for the resident trellis-server (see src/trellis-server.cpp):
 //   GET  /health   -> "ok"
-//   POST /generate  multipart: image file + seed/resolution/bg_removal/uv fields
+//   POST /generate  multipart: image file + seed/resolution/bg_removal/uv/texture fields
 //                   -> model/gltf-binary, or JSON {"error": "..."} on failure.
 
 import { apiBase, loadConfig } from "./config";
@@ -31,6 +31,7 @@ function toForm(image: Blob, p: GenParams): FormData {
   fd.append("resolution", String(p.resolution));
   if (p.bgRemoval !== "auto") fd.append("bg_removal", p.bgRemoval);
   fd.append("uv", p.uv);
+  if (!p.texture) fd.append("texture", "off");
   return fd;
 }
 

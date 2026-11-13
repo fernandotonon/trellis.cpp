@@ -77,11 +77,17 @@ struct TrellisParams {
                                 //   speckle (issue #22). >0 forces that width (e.g. 1 for
                                 //   the thin-wall reference look, 2 for a thicker shell).
     int  decim    = -1;         // decimation cluster grid   (-1 => per-cascade default)
+    int  faces    = -1;         // QEM decimation face target (-1 => per-cascade default,
+                                //   see qem_face_target()). Only the default QEM path
+                                //   (decim < 0) uses it; --decim N and --decim 0 bypass QEM.
     int  tex      = -1;         // UV atlas size in px        (-1 => per-cascade default)
     int  tex_res  = -1;         // texture PBR resolution: -1 => auto (drop dense res-1024 tex to
                                 //   512, whose clean coarse PBR bakes onto the res-1024 mesh
                                 //   without the partial-coverage "skin" speckle); else force 512/1024
     int  webp     = -1;         // GLB texture encoding: -1 auto (WebP if built with it), 1 on, 0 off (PNG)
+    int  normal_map = 0;        // bake a tangent-space normal map from the remeshed shell onto the
+                                //   decimated mesh and add it to the GLB as a third texture
+                                //   (--normal-map on|off, server "normal_map"; default off)
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast
@@ -136,5 +142,36 @@ void print_usage(const char* argv0, bool server);
 // error OR when --help was requested; check p.help to tell them apart.
 bool parse_args(int argc, char** argv, TrellisParams& p);
 bool parse_camera_arg(const std::string& name, const char* value, TrellisParams& p, std::string& error);
+
+// ---- QEM face target (--faces / server field "faces") ----
+// The default postprocess quadric-simplifies the remeshed surface to a face budget before
+// UV unwrap and bake. Lower budgets give lighter game/web assets and a faster xatlas pass;
+// the texture still carries the surface detail the geometry drops.
+constexpr int kQemFacesCascade = 300000;   // default @1024 / @1536 (reference parity)
+constexpr int kQemFacesLight   = 150000;   // default @512
+constexpr int kQemFacesMin     = 1000;     // below this QEM collapses thin parts outright
+
+// The face budget this run decimates to: --faces when given, else the per-cascade default.
+inline int qem_face_target(const TrellisParams& p) {
+    return p.faces > 0 ? p.faces : (p.cascade ? kQemFacesCascade : kQemFacesLight);
+}
+
+// Parse a face target ("50000"; "auto" restores the default). Shared by the CLI's --faces
+// and trellis-server's "faces" field so both accept and reject exactly the same values.
+bool parse_faces_arg(const char* value, TrellisParams& p, std::string& error);
+
+// --faces only steers the QEM path; reject it alongside --decim (cluster grid or 0 = keep
+// full mesh) rather than silently ignoring it. Call after all params are applied.
+bool check_faces_compat(const TrellisParams& p, std::string& error);
+
+// ---- UV atlas size (--atlas / server field "atlas") ----
+// Side length in px of the square textures baked onto the mesh (base color + metallic/
+// roughness). Default 2048 for the cascade, 1024 at res 512 (trellis_cli.cpp, `T`).
+constexpr int kAtlasMin = 256;
+constexpr int kAtlasMax = 8192;     // 8192^2 RGBA is already ~256 MB per map while baking
+
+// Parse an atlas size ("2048"; "auto" restores the default). Shared by the CLI's --atlas
+// and trellis-server's "atlas" field, like parse_faces_arg.
+bool parse_atlas_arg(const char* value, TrellisParams& p, std::string& error);
 
 }  // namespace trellis

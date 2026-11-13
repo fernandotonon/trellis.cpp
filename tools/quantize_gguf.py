@@ -2,11 +2,17 @@
 """Selectively quantize a trellis.cpp GGUF: F16 2D matmul weights -> Q8_0/Q5_0/Q4_0,
 everything else (F32 norms/biases, conv/patch weights, 1D/3D/4D tensors) kept as-is.
 Only 2D tensors whose contraction dim (ne0) is block-aligned are quantized, since those
-are the ggml_mul_mat weights that ggml dequantizes on the fly on every backend."""
+are the ggml_mul_mat weights that ggml dequantizes on the fly on every backend.
+Tensors with ne0 < K_MIN stay F16: they are the tiny latent projections (32/64 -> 1024/1536),
+quantizing them saves only KB, and ggml-vulkan's integer-dot Q8_0 matmul returns NaN rows for
+K = 32/64 on RDNA2 + the AMD Windows driver (issue #50). Model::load applies the same bound
+(kMinQuantK) to files quantized before this rule."""
 import sys, os
 import numpy as np
 import gguf
 from gguf import GGMLQuantizationType as GT, GGUFValueType as VT
+
+K_MIN = 128   # keep in sync with kMinQuantK in include/trellis_model.h
 
 def block_size(qtype):
     return gguf.GGML_QUANT_SIZES[qtype][0]
@@ -33,7 +39,7 @@ def quantize_file(src, dst, qname):
     q_bytes = keep_bytes = 0
     for t in r.tensors:
         d = t.data
-        if t.tensor_type == GT.F16 and d.ndim == 2 and d.shape[-1] % bs == 0:
+        if t.tensor_type == GT.F16 and d.ndim == 2 and d.shape[-1] % bs == 0 and d.shape[-1] >= K_MIN:
             q = gguf.quants.quantize(d.astype(np.float32), qtype)
             w.add_tensor(t.name, q, raw_dtype=qtype)
             nq += 1; q_bytes += q.nbytes

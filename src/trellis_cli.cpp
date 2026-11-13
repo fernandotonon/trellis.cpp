@@ -5,6 +5,7 @@
 #include "trellis_debug.h"
 #include "trellis_sched.h"
 #include "preprocess.h"
+#include "birefnet.h"   // BirefnetAllocError: the GPU->CPU->threshold fallback keys on it
 #include "dinov3.h"
 #include "pixal3d.h"
 #include "flow_runner.h"
@@ -18,10 +19,13 @@
 #include "mesh_shape.h"
 #include "stb_image_write.h"
 #include "trellis_run.h"
+#include "retopo_process.h"
 #include "ggml.h"   // proj_in_channels is read straight off the checkpoint's proj_linear weight
+#include "ggml-cpu.h"   // ggml_backend_is_cpu: the BiRefNet retry only makes sense off the CPU
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <random>
 #include <vector>
 #include <string>
@@ -48,6 +52,19 @@ static bool backend_is_htp(const std::string& backend) {
            std::tolower((unsigned char)backend[2]) == 'p';
 }
 // [dbg] overall stats of a flat tensor — used to compare LR vs HR shape-SLAT in decode space.
+// Pixal3D's projection grid is y-up with the camera on +z (pixal3d_project_cell: image up =
+// grid y). TRELLIS.2's is z-up with the front on -y, which is what the writers' (x,y,z)->(x,z,-y)
+// glTF rotation assumes. Without this, Pixal3D models are written lying on their backs. The
+// rotation is applied only to the final vertex arrays, after every stage that samples the voxel
+// grid (remesh, PBR bake) has run in grid coordinates. det = +1, so winding is unchanged.
+static void pixal3d_to_trellis_frame(vector<float>& v) {
+    for (size_t i = 0; i + 2 < v.size(); i += 3) {
+        const float y = v[i + 1], z = v[i + 2];
+        v[i + 1] = -z;
+        v[i + 2] = y;
+    }
+}
+
 static void slat_stats(const char* tag, const vector<float>& v) {
     if (v.empty()) { printf("      [stats] %s EMPTY\n", tag); return; }
     double s = 0, s2 = 0; float mn = 0, mx = 0; bool first = true; size_t bad = 0;
@@ -70,8 +87,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     namespace fs = std::filesystem;
     fs::path retopo_driver, retopo_run;
     if (cfg.retopo) {
-#ifndef __linux__
-        fprintf(stderr,"[trellis] native retopo launch is currently supported on Linux only\n");
+#if !defined(__linux__) && !defined(_WIN32)
+        fprintf(stderr,"[trellis] native retopo launch is supported on Linux and Windows\n");
         return 1;
 #else
         if (!cfg.texture || cfg.bg_only || std::getenv("TRELLIS_STOP_AFTER_POST_DUMP")) {
@@ -85,9 +102,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             return 1;
         }
         std::error_code ec;
+#ifdef _WIN32
+        retopo_driver=trellis::retopo_process::executable_directory()/"trellis-retopo-atlas.exe";
+        const bool driver_available=fs::is_regular_file(retopo_driver,ec);
+#else
         retopo_driver=fs::canonical("/proc/self/exe",ec).parent_path()/"trellis-retopo-atlas";
-        if (ec || access(retopo_driver.c_str(),X_OK)!=0) {
-            fprintf(stderr,"[trellis] retopo driver unavailable: %s\n",retopo_driver.c_str());
+        const bool driver_available=!ec && access(retopo_driver.c_str(),X_OK)==0;
+#endif
+        if (ec || !driver_available) {
+            fprintf(stderr,"[trellis] retopo driver unavailable: %s\n",retopo_driver.string().c_str());
             return 1;
         }
         const fs::path root=fs::absolute(cfg.retopo_workdir);
@@ -96,6 +119,21 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             fprintf(stderr,"[trellis] cannot create retopo workdir: %s\n",ec.message().c_str());
             return 1;
         }
+#ifdef _WIN32
+        std::random_device random;
+        bool created=false;
+        for (int attempt=0;attempt<64 && !created;++attempt) {
+            const uint64_t nonce=(uint64_t(random())<<32)|random();
+            retopo_run=root/("run-"+std::to_string(nonce));
+            created=fs::create_directory(retopo_run,ec);
+            if (ec && ec!=std::errc::file_exists) break;
+            ec.clear();
+        }
+        if (!created) {
+            fprintf(stderr,"[trellis] cannot create retopo run directory: %s\n",ec.message().c_str());
+            return 1;
+        }
+#else
         std::string pattern=(root/"run-XXXXXX").string();
         std::vector<char> mutable_pattern(pattern.begin(),pattern.end());
         mutable_pattern.push_back('\0');
@@ -105,6 +143,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             return 1;
         }
         retopo_run=created;
+#endif
 #endif
     }
     // Unbuffered, not line-buffered: MSVCRT treats _IOLBF as full buffering, which
@@ -216,14 +255,43 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // once, normalized for 512 and 1024.
         // BiRefNet's small convolutions are slower and currently nondeterministic on HTP.
         // Keep other explicitly selected backends on their existing path.
-        const std::string bg_saved_backend = trellis::g_backend;
+        //
+        // The matte needs ~0.45 GB of weights plus a ~0.9 GB compute buffer for the stage-0
+        // window-attention graph (TRELLIS_DBG_ALLOC=1 prints every graph). On GPUs that cannot
+        // spare that (issue #24: "birefnet alloc") the run used to die right here, even though
+        // the flow stages that follow would have fit. So: GPU, then the same model on the CPU
+        // backend (same output, slower), and in auto mode the threshold matte as a last resort.
+        bool matte_on_cpu = false;   // where the last attempt actually ran (a CPU-only build has no GPU to fall back from)
+        auto run_matte = [&](bool on_cpu) {
+            const std::string bg_saved_backend = trellis::g_backend;
+            if (on_cpu) trellis::g_backend = "CPU";
+            trellis::Model bm = trellis::Model::load(M + "/birefnet.gguf", on_cpu ? -1 : gpu);
+            trellis::g_backend = bg_saved_backend;
+            matte_on_cpu = ggml_backend_is_cpu(bm.backend);
+            try {
+                cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz);
+            } catch (...) {
+                bm.free();   // Model has no destructor: a throw here used to leak the weights
+                throw;       // on the device, and every retry started with less memory.
+            }
+            bm.free();
+        };
         const bool bg_on_cpu = backend_is_htp(requested_backend);
-        if (bg_on_cpu) trellis::g_backend = "CPU";
-        trellis::Model bm = trellis::Model::load(M + "/birefnet.gguf",
-                                                 bg_on_cpu ? -1 : gpu);
-        trellis::g_backend = bg_saved_backend;
-        cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz);
-        bm.free();
+        try {
+            run_matte(bg_on_cpu);
+        } catch (const trellis::BirefnetAllocError& e) {
+            printf("      %s\n", e.what());
+            if (!matte_on_cpu) {
+                printf("      -> retrying BiRefNet on the CPU backend (same matte, slower)\n"); fflush(stdout);
+                try { run_matte(true); }
+                catch (const std::exception& e2) { printf("      %s\n", e2.what()); }
+            }
+            if (cutout.empty()) {
+                if (cfg.birefnet == 1) throw;   // explicit --bg-removal birefnet: report, don't substitute
+                printf("      -> falling back to the threshold matte; bright highlights may punch holes\n"); fflush(stdout);
+                cutout = trellis::threshold_cutout(img, cut_sz);
+            }
+        }
         if (cutout.empty()) return 1;
         chw = trellis::normalize_cutout(cutout, cut_sz, 512);
         if (cascade) chw1024 = trellis::normalize_cutout(cutout, cut_sz, 1024);
@@ -713,13 +781,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
         fs::path retopo_post;
         if (cfg.retopo) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
             retopo_post=retopo_run/"source.post";
-            if (!dump_post(retopo_post.c_str())) {
-                fprintf(stderr,"[trellis] failed writing retopo POST %s\n",retopo_post.c_str());
+            if (!dump_post(retopo_post.string().c_str())) {
+                fprintf(stderr,"[trellis] failed writing retopo POST %s\n",retopo_post.string().c_str());
                 return 1;
             }
-            printf("      [retopo] POST and intermediates -> %s\n",retopo_run.c_str());
+            printf("      [retopo] POST and intermediates -> %s\n",retopo_run.string().c_str());
 #endif
         }
         if (dual_pbr_path) {
@@ -747,13 +815,32 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         }
         if (std::getenv("TRELLIS_STOP_AFTER_POST_DUMP")) return 0;
         if (cfg.retopo) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
             const fs::path quad_glb=retopo_run/"model.glb";
             std::vector<std::string> args={retopo_driver.string(),"--from-post",retopo_post.string(),
                 quad_glb.string(),std::to_string(cfg.retopo_grid),
                 std::to_string(cfg.retopo_first_faces),std::to_string(cfg.retopo_final_faces),
                 std::to_string(cfg.retopo_atlas)};
             if (cfg.retopo_no_weld_fill) args.emplace_back("--no-weld-fill");
+#ifdef _WIN32
+            std::vector<std::pair<std::wstring,std::wstring>> child_env={
+                {L"TEMP",retopo_run.wstring()},{L"TMP",retopo_run.wstring()},
+                {L"TRELLIS_RETOPO_SEED",std::to_wstring(run_seed)},
+                {L"TRELLIS_RETOPO_COPYRIGHT",trellis::retopo_process::wide(cfg.copyright)},
+                {L"TRELLIS_RETOPO_PBR_POST",L""}};
+            if (cfg.retopo_dual_pbr)
+                child_env.emplace_back(L"TRELLIS_RETOPO_PBR_POST",
+                    trellis::retopo_process::wide(retopo_dual_post));
+            int status=1;
+            try {
+                status=trellis::retopo_process::run(retopo_driver,
+                    {args.begin()+1,args.end()},child_env);
+            } catch (const std::exception& error) {
+                fprintf(stderr,"[trellis] cannot launch retopo driver: %s\n",error.what());
+                return 1;
+            }
+            const bool stage_ok=status==0;
+#else
             std::vector<char*> raw;
             for (auto& arg:args) raw.push_back(arg.data());
             raw.push_back(nullptr);
@@ -782,10 +869,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 return 1;
             }
             int status=0;
-            if (waitpid(child,&status,0)<0 || !WIFEXITED(status) || WEXITSTATUS(status)!=0 ||
+            const bool stage_ok=waitpid(child,&status,0)>=0 && WIFEXITED(status) &&
+                                WEXITSTATUS(status)==0;
+#endif
+            if (!stage_ok ||
                 !fs::is_regular_file(quad_glb) ||
                 !fs::is_regular_file(retopo_run/"model.retopo-accepted.json")) {
-                fprintf(stderr,"[trellis] retopo failed; diagnostics in %s\n",retopo_run.c_str());
+                fprintf(stderr,"[trellis] retopo failed; diagnostics in %s\n",retopo_run.string().c_str());
                 return 1;
             }
             std::error_code ec;
@@ -795,21 +885,32 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 fprintf(stderr,"[trellis] cannot create output directory: %s\n",ec.message().c_str());
                 return 1;
             }
+#ifdef _WIN32
+            const fs::path staged=destination.string()+".retopo-staged-"+
+                                  std::to_string(GetCurrentProcessId());
+#else
             const fs::path staged=destination.string()+".retopo-staged-"+std::to_string(getpid());
+#endif
             fs::copy_file(quad_glb,staged,fs::copy_options::overwrite_existing,ec);
             if (ec) {
                 fprintf(stderr,"[trellis] cannot stage retopo GLB: %s\n",ec.message().c_str());
                 fs::remove(staged);
                 return 1;
             }
+#ifdef _WIN32
+            if (!MoveFileExW(staged.c_str(),destination.c_str(),
+                             MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
+                ec=std::error_code(GetLastError(),std::system_category());
+#else
             fs::rename(staged,destination,ec);
+#endif
             if (ec) {
                 fprintf(stderr,"[trellis] cannot publish retopo GLB: %s\n",ec.message().c_str());
                 fs::remove(staged);
                 return 1;
             }
             printf("done in %.1fs -> %s (quad audit: %s)\n",now()-t0,
-                   outglb.c_str(),(retopo_run/"model.retopo-accepted.json").c_str());
+                   outglb.c_str(),(retopo_run/"model.retopo-accepted.json").string().c_str());
             return 0;
 #endif
         }
@@ -853,8 +954,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         } else if (cfg.decim == 0) {
             dv = sverts; df = sfaces;
         } else {
+            // Face budget: --faces / server "faces", else the per-cascade default (issue #43).
+            const int qem_target = trellis::qem_face_target(cfg);
+            printf("  QEM simplify: F=%d -> target %d faces%s\n", (int)sfaces.size()/3, qem_target,
+                   cfg.faces > 0 ? "" : " (default)");
+            fflush(stdout);
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
-                                  cascade ? 300000 : 150000, dv, df);
+                                  qem_target, dv, df);
             if (!std::getenv("TRELLIS_QEM_PRESERVE_TOPOLOGY") &&
                 !std::getenv("TRELLIS_QEM_COLLISION_GUARD")) {
                 trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
@@ -897,30 +1003,55 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                    smoothed.maximum_displacement);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
+        // --normal-map: a second BVH over the remeshed shell (not the decoded `mesh`, whose
+        // sub-voxel outer-skin noise the band offset exists to absorb, issue #22) gives the
+        // bake a dense normal per texel; the decimated mesh keeps the shell's surface detail
+        // at any face budget. Search radius 32 voxels: texels farther from the shell than
+        // that (QEM error) fall back to the flat normal and are counted in the log.
+        trellis::TriBvh nbvh;
+        trellis::NormalSource nsrc;
+        if (cfg.normal_map && rm.F() > 0) {
+            const double tn0 = now();
+            nbvh = trellis::TriBvh::build(rm.verts.data(), rm.V(), rm.faces.data(), rm.F());
+            nsrc = trellis::NormalSource{&nbvh, rm.verts.data(), rm.faces.data(), 32.0f / (float)so.res};
+            printf("  normal map: BVH over the remeshed shell (F=%d) in %.1fs\n", rm.F(), now() - tn0);
+            fflush(stdout);
+        } else if (cfg.normal_map) {
+            printf("  normal map: skipped (remesh empty, no dense shell to bake from)\n");
+        }
+        const trellis::NormalSource* nsp = nsrc.ok() ? &nsrc : nullptr;
         // Texels are shaded straight from the per-voxel PBR volume (trilinear sampling, the
         // reference bake behavior) rather than from decimation-averaged vertex colors, so
         // full material detail survives simplification.
         trellis::VoxelPbr vox{pbr_coords, &pbr6, pbr_res, &bvh};
         const std::vector<float> no_vp;
-        trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)
-                                      : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox);
-        if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox);
+        trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox, nsp)
+                                      : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox, nsp);
+        if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox, nsp);
         if (bm.ok()) {
+            if (pix) pixal3d_to_trellis_frame(bm.verts);
             trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
                                         bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
                                         /*double_sided=*/rm.F() == 0, run_seed,
                                         cfg.copyright.empty() ? nullptr : cfg.copyright.c_str(),
-                                        /*use_webp=*/cfg.webp != 0);
+                                        /*use_webp=*/cfg.webp != 0,
+                                        bm.nrm.empty() ? nullptr : bm.nrm.data(),
+                                        bm.tangents.empty() ? nullptr : bm.tangents.data());
             std::string tex = outglb.substr(0, outglb.find_last_of('.')) + "_base.png";
             stbi_write_png(tex.c_str(), bm.T, bm.T, 4, bm.base.data(), bm.T*4);
+            if (!bm.nrm.empty()) {
+                std::string ntex = outglb.substr(0, outglb.find_last_of('.')) + "_normal.png";
+                stbi_write_png(ntex.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
+            }
             textured = true;
-            printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
+            printf("      textured GLB (atlas %d, +%s%s)\n", bm.T, tex.c_str(), bm.nrm.empty() ? "" : ", +normal map");
         } else printf("      uv_bake failed; falling back to vertex colors\n");
     }
     if (cfg.retopo && !textured) {
         fprintf(stderr,"[trellis] textured POST unavailable for retopo\n");
         return 1;
     }
+    if (pix) pixal3d_to_trellis_frame(mesh.verts);   // untextured GLB and the .ply
     if (!textured)
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),
                            colors.empty() ? nullptr : colors.data(), run_seed,

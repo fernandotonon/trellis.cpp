@@ -45,7 +45,7 @@ export async function renderSettings(
 
     body.innerHTML = `
       ${ro("Backend", cfg.backend)}
-      ${ro("Server binary", cfg.serverBin)}
+      ${field("Server binary (trellis-server)", "set-bin", cfg.serverBin)}
       ${field("Models directory", "set-models", cfg.modelsDir)}
       ${dirField("Output folder (generated GLBs are saved here)", "set-output", outputDir)}
       ${field("GPU index (&lt;0 = CPU)", "set-gpu", String(cfg.gpu), "number")}
@@ -83,30 +83,35 @@ export async function renderSettings(
       }
     };
 
+    // Report a failed (re)start instead of swallowing it: with a manual setup the
+    // shell has no server binary yet, so restart_server errors and the app just
+    // sits at "offline" looking like it ignored the new models directory (#21).
+    const restart = async () => {
+      try {
+        await invoke("restart_server");
+      } catch (e) {
+        alert(`Could not start the server: ${(e as Error).message ?? e}`);
+      }
+    };
+
     const save = async () => {
+      const serverBin = (body.querySelector("#set-bin") as HTMLInputElement).value.trim();
       const modelsDir = (body.querySelector("#set-models") as HTMLInputElement).value.trim();
       const gpu = parseInt((body.querySelector("#set-gpu") as HTMLInputElement).value, 10);
       const port = parseInt((body.querySelector("#set-port") as HTMLInputElement).value, 10);
       await saveConfig({
+        serverBin,
         modelsDir,
         gpu: isNaN(gpu) ? 0 : gpu,
         port: isNaN(port) ? 8080 : port,
         outputDir: outputInput.value.trim(),
       });
-      try {
-        await invoke("restart_server");
-      } catch {
-        /* shell will surface its own error; status polling reflects it */
-      }
+      await restart();
       onSaved();
     };
     (body.querySelector("#set-save") as HTMLButtonElement).onclick = save;
     (body.querySelector("#set-restart") as HTMLButtonElement).onclick = async () => {
-      try {
-        await invoke("restart_server");
-      } catch {
-        /* ignore */
-      }
+      await restart();
       onSaved();
     };
   } else {

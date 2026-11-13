@@ -143,6 +143,15 @@ std::vector<float> DitRunner::forward(const std::vector<float>& xt, float t_scal
                     nm, bad, v.size(), amax);
         }
     }
+    // A forward with NO finite output is a broken backend, not a stray NaN: the sampler's
+    // safety net would zero every velocity and hand the decoder the initial noise, which then
+    // fails stages later with nothing pointing back here (issue #50). Stop at the source.
+    if (!outv.empty() && out_bad == outv.size() && !std::getenv("TRELLIS_NOFIX")) {
+        const char* be = m_.backend ? ggml_backend_name(m_.backend) : "?";
+        throw std::runtime_error(std::string("flow: every output of this forward is NaN/Inf on ") + be +
+            " -- the model is miscomputing on this device. Run with --verbose and TRELLIS_DBG_NAN=1"
+            " to see the first bad layer, and try --backend CPU to confirm.");
+    }
     return outv;
 }
 

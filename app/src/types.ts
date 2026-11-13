@@ -10,6 +10,8 @@ export interface GenParams {
   seed: number;
   bgRemoval: BgRemoval;
   uv: Uv;
+  /** false => geometry only (server field texture=off). */
+  texture: boolean;
 }
 
 export const DEFAULT_PARAMS: GenParams = {
@@ -17,6 +19,7 @@ export const DEFAULT_PARAMS: GenParams = {
   seed: 42,
   bgRemoval: "auto",
   uv: "xatlas",
+  texture: true,
 };
 
 /** Written by the installer, read by the Tauri shell + surfaced to the UI. */
