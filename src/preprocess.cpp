@@ -41,6 +41,29 @@ std::vector<float> cutout_to_chw01(const std::vector<unsigned char>& rgb, int sz
 }
 
 // alpha [W*H] (>0.8 = foreground) -> bbox crop (side = long side * margin) + premultiplied square RGBA uint8.
+// Python round() (half to even) of twice/2.
+static int round_half_even_of_half(long twice) {
+    if (twice % 2 == 0) return (int)(twice / 2);
+    const long n = (long)std::floor(twice / 2.0);
+    return (int)((n & 1) == 0 ? n : n + 1);
+}
+
+void crop_window(int xmin, int ymin, int xmax, int ymax, float margin, int& x0, int& y0, int& sz) {
+    if (margin <= 0.0f) {   // legacy: centre (integer) +/- int((bbox/2 + 1) * 1.10)
+        const int cx = (xmin+xmax)/2, cy = (ymin+ymax)/2;
+        const int half = (int)((std::max(xmax-xmin, ymax-ymin)/2 + 1) * 1.10f);
+        sz = 2*half; x0 = cx - half; y0 = cy - half;
+        return;
+    }
+    // Upstream: size = int(max(w, h) * margin) with w = xmax - xmin;
+    // box = center -/+ size // 2, which PIL's crop rounds half to even.
+    const int size = (int)(std::max(xmax-xmin, ymax-ymin) * (double)margin);
+    const int h = size / 2;
+    sz = 2*h;
+    x0 = round_half_even_of_half((long)xmin + xmax - 2L*h);
+    y0 = round_half_even_of_half((long)ymin + ymax - 2L*h);
+}
+
 static std::vector<unsigned char> alpha_to_cutout(const unsigned char* rgba, int W, int H,
                                                   const std::vector<float>& alpha, int& sz,
                                                   float margin) {
@@ -48,12 +71,11 @@ static std::vector<unsigned char> alpha_to_cutout(const unsigned char* rgba, int
     for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x)
         if (alpha[(size_t)y*W + x] > 0.8f) { xmin=std::min(xmin,x); ymin=std::min(ymin,y); xmax=std::max(xmax,x); ymax=std::max(ymax,y); }
     if (xmax < 0) { xmin=0; ymin=0; xmax=W-1; ymax=H-1; }
-    int cx=(xmin+xmax)/2, cy=(ymin+ymax)/2;
-    int half=(int)((std::max(xmax-xmin, ymax-ymin)/2 + 1) * margin);
-    sz = 2*half;
+    int x0, y0;
+    crop_window(xmin, ymin, xmax, ymax, margin, x0, y0, sz);
     std::vector<unsigned char> crop((size_t)sz*sz*4, 0);
     for (int y = 0; y < sz; ++y) for (int x = 0; x < sz; ++x) {
-        int sx=cx-half+x, sy=cy-half+y;
+        int sx=x0+x, sy=y0+y;
         if (sx<0||sy<0||sx>=W||sy>=H) continue;
         float a = std::clamp(alpha[(size_t)sy*W + sx], 0.0f, 1.0f);
         const size_t dst = ((size_t)y*sz + x)*4;

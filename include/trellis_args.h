@@ -63,8 +63,8 @@ struct TrellisParams {
     int  hr_res     = 1024;     // HR cascade target resolution (1024 / 1536)
     int  max_tokens = 49152;    // HR token budget (backoff floors at 1024)
 
-    float crop_margin = 1.10f;  // square crop side = bbox long side * this (--crop-margin).
-                                // Upstream TRELLIS.2 crops tight (1.0); 1.10 is this port's default.
+    float crop_margin = 0.0f;   // 0 = this port's legacy ~x1.10 crop; > 0 = upstream TRELLIS.2's
+                                // crop with side = bbox * this (--crop-margin; upstream uses 1.0).
     int birefnet = -1;          // bg removal: 1 BiRefNet, 0 white-threshold, -1 auto
                                 // (auto: keep a pre-matted image's alpha; else BiRefNet when
                                 // birefnet.gguf is present; threshold as last resort. The

@@ -145,6 +145,8 @@ add_executable(trellis-audit-quad-topology tools/mesh_quad_matching/audit_quad_t
 target_link_libraries(trellis-audit-quad-topology PRIVATE trellis_core)
 add_executable(trellis-test-quad-topology src/test_quad_topology.cpp)
 target_link_libraries(trellis-test-quad-topology PRIVATE trellis_core)
+add_executable(trellis-test-crop src/test_crop.cpp)
+target_link_libraries(trellis-test-crop PRIVATE trellis_core)
 
 option(TRELLIS_RETOPO_MATCHING "Build the native quad-matching stage" OFF)
 option(TRELLIS_RETOPO_COLLISION "Build the exact collision-safe quad matcher" OFF)

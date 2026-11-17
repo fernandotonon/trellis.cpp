@@ -11,7 +11,14 @@ std::vector<float> preprocess_image(const std::string& path, int S = 512);
 
 // Non-neural background removal: existing alpha if present, else white-bg threshold;
 // bbox-crop + premultiply on transparent black -> square RGBA uint8 cutout (size in `sz`).
-std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz, float margin = 1.10f);
+// margin <= 0 keeps this port's legacy crop (side = 2*int((bbox/2 + 1) * 1.10));
+// margin > 0 reproduces upstream TRELLIS.2 preprocess_image exactly for that factor
+// (side = int(bbox * margin), PIL crop at center -/+ side//2 rounded half-to-even).
+std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz, float margin = 0.0f);
+
+// Square crop window for a subject bbox (inclusive pixel bounds), as described above:
+// left/top corner in x0/y0, side in sz. Exposed for tests.
+void crop_window(int xmin, int ymin, int xmax, int ymax, float margin, int& x0, int& y0, int& sz);
 
 // True when the image carries a real (not all-opaque) alpha channel, i.e. it is
 // pre-matted and needs no background removal.
@@ -21,7 +28,7 @@ bool image_has_alpha(const std::string& path);
 // bbox-crop and premultiply -> square RGBA uint8 cutout
 // (size returned in `sz`). bm = loaded birefnet model, gpu = device for the deform kernel.
 std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model& bm, int gpu, int& sz,
-                                           float margin = 1.10f);
+                                           float margin = 0.0f);
 // Resize a square RGB/RGBA-uint8 cutout to SxS, ImageNet-normalize -> [3,S,S] torch CHW.
 std::vector<float> normalize_cutout(const std::vector<unsigned char>& rgb, int sz, int S);
 
