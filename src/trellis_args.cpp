@@ -142,6 +142,7 @@ void print_usage(const char* argv0, bool server) {
         "                          is present. The plain threshold matte cuts out specular\n"
         "                          highlights, which the flow then turns into holes.)\n"
         "      --birefnet          alias for --bg-removal birefnet\n"
+        "      --crop-margin F     square crop = subject bbox * F (default 1.10; upstream 1.0)\n"
         "      --no-texture        geometry only\n"
         "      --xatlas            xatlas UV unwrap (default)\n"
         "      --box-uv            voxel-native box projection (faster)\n"
@@ -243,6 +244,9 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--max-tokens")           { const char* v = need(a.c_str()); if (!v) return false; p.max_tokens = atoi(v); }
         else if (a == "--bg-removal")           { const char* v = need(a.c_str()); if (!v) return false; p.birefnet = (std::strcmp(v, "birefnet") == 0) ? 1 : 0; }
         else if (a == "--birefnet")             { p.birefnet = 1; }
+        else if (a == "--crop-margin")          { const char* v = need(a.c_str()); if (!v) return false;
+                                                  p.crop_margin = (float)atof(v);
+                                                  if (!(p.crop_margin >= 1.0f && p.crop_margin <= 2.0f)) { fprintf(stderr, "[trellis] --crop-margin expects 1.0..2.0\n"); return false; } }
         else if (a == "--no-texture")           { p.texture = false; }
         else if (a == "--xatlas")               { p.xatlas = true; }
         else if (a == "--box-uv")               { p.xatlas = false; }

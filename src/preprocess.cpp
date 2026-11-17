@@ -40,15 +40,16 @@ std::vector<float> cutout_to_chw01(const std::vector<unsigned char>& rgb, int sz
     return out;
 }
 
-// alpha [W*H] (>0.8 = foreground) -> bbox crop (10% margin) + premultiplied square RGBA uint8.
+// alpha [W*H] (>0.8 = foreground) -> bbox crop (side = long side * margin) + premultiplied square RGBA uint8.
 static std::vector<unsigned char> alpha_to_cutout(const unsigned char* rgba, int W, int H,
-                                                  const std::vector<float>& alpha, int& sz) {
+                                                  const std::vector<float>& alpha, int& sz,
+                                                  float margin) {
     int xmin = W, ymin = H, xmax = -1, ymax = -1;
     for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x)
         if (alpha[(size_t)y*W + x] > 0.8f) { xmin=std::min(xmin,x); ymin=std::min(ymin,y); xmax=std::max(xmax,x); ymax=std::max(ymax,y); }
     if (xmax < 0) { xmin=0; ymin=0; xmax=W-1; ymax=H-1; }
     int cx=(xmin+xmax)/2, cy=(ymin+ymax)/2;
-    int half=(int)((std::max(xmax-xmin, ymax-ymin)/2 + 1) * 1.10f);
+    int half=(int)((std::max(xmax-xmin, ymax-ymin)/2 + 1) * margin);
     sz = 2*half;
     std::vector<unsigned char> crop((size_t)sz*sz*4, 0);
     for (int y = 0; y < sz; ++y) for (int x = 0; x < sz; ++x) {
@@ -72,7 +73,7 @@ bool image_has_alpha(const std::string& path) {
     return has_alpha;
 }
 
-std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz) {
+std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz, float margin) {
     int W, H, ch;
     unsigned char* img = stbi_load(path.c_str(), &W, &H, &ch, 4);   // force RGBA
     if (!img) { fprintf(stderr, "preprocess: cannot load %s\n", path.c_str()); sz = 0; return {}; }
@@ -85,7 +86,7 @@ std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz) {
         if (has_alpha) alpha[i] = img[4*i+3] / 255.0f;
         else { int mn = std::min({img[4*i], img[4*i+1], img[4*i+2]}); alpha[i] = mn < 232 ? 1.0f : 0.0f; }
     }
-    std::vector<unsigned char> crop = alpha_to_cutout(img, W, H, alpha, sz);
+    std::vector<unsigned char> crop = alpha_to_cutout(img, W, H, alpha, sz, margin);
     stbi_image_free(img);
     return crop;
 }
@@ -97,7 +98,7 @@ std::vector<float> preprocess_image(const std::string& path, int S) {
     return normalize_cutout(crop, sz, S);
 }
 
-std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model& bm, int gpu, int& sz) {
+std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model& bm, int gpu, int& sz, float margin) {
     int W, H, ch;
     unsigned char* img = stbi_load(path.c_str(), &W, &H, &ch, 4);
     if (!img) { fprintf(stderr, "birefnet_cutout: cannot load %s\n", path.c_str()); sz = 0; return {}; }
@@ -121,7 +122,7 @@ std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model&
         sz = 0;
         return {};
     }
-    std::vector<unsigned char> crop = alpha_to_cutout(img, W, H, alpha, sz);
+    std::vector<unsigned char> crop = alpha_to_cutout(img, W, H, alpha, sz, margin);
     stbi_image_free(img);
     return crop;
 }

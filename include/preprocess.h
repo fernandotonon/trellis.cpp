@@ -11,7 +11,7 @@ std::vector<float> preprocess_image(const std::string& path, int S = 512);
 
 // Non-neural background removal: existing alpha if present, else white-bg threshold;
 // bbox-crop + premultiply on transparent black -> square RGBA uint8 cutout (size in `sz`).
-std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz);
+std::vector<unsigned char> threshold_cutout(const std::string& path, int& sz, float margin = 1.10f);
 
 // True when the image carries a real (not all-opaque) alpha channel, i.e. it is
 // pre-matted and needs no background removal.
@@ -20,7 +20,8 @@ bool image_has_alpha(const std::string& path);
 // BiRefNet background removal: run the matte, restore it to the source aspect ratio, then
 // bbox-crop and premultiply -> square RGBA uint8 cutout
 // (size returned in `sz`). bm = loaded birefnet model, gpu = device for the deform kernel.
-std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model& bm, int gpu, int& sz);
+std::vector<unsigned char> birefnet_cutout(const std::string& path, const Model& bm, int gpu, int& sz,
+                                           float margin = 1.10f);
 // Resize a square RGB/RGBA-uint8 cutout to SxS, ImageNet-normalize -> [3,S,S] torch CHW.
 std::vector<float> normalize_cutout(const std::vector<unsigned char>& rgb, int sz, int S);
 

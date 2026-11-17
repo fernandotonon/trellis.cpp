@@ -269,7 +269,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             trellis::g_backend = bg_saved_backend;
             matte_on_cpu = ggml_backend_is_cpu(bm.backend);
             try {
-                cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz);
+                cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz, cfg.crop_margin);
             } catch (...) {
                 bm.free();   // Model has no destructor: a throw here used to leak the weights
                 throw;       // on the device, and every retry started with less memory.
@@ -289,7 +289,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             if (cutout.empty()) {
                 if (cfg.birefnet == 1) throw;   // explicit --bg-removal birefnet: report, don't substitute
                 printf("      -> falling back to the threshold matte; bright highlights may punch holes\n"); fflush(stdout);
-                cutout = trellis::threshold_cutout(img, cut_sz);
+                cutout = trellis::threshold_cutout(img, cut_sz, cfg.crop_margin);
             }
         }
         if (cutout.empty()) return 1;
@@ -297,7 +297,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         if (cascade) chw1024 = trellis::normalize_cutout(cutout, cut_sz, 1024);
     } else {
         printf("[1/6] preprocess %s (%s)\n", img.c_str(), cascade ? "1024 cascade" : "512");
-        cutout = trellis::threshold_cutout(img, cut_sz);
+        cutout = trellis::threshold_cutout(img, cut_sz, cfg.crop_margin);
         if (cutout.empty()) return 1;
         chw = trellis::normalize_cutout(cutout, cut_sz, 512);
         if (cascade) chw1024 = trellis::normalize_cutout(cutout, cut_sz, 1024);
